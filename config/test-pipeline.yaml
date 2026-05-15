@@ -1,0 +1,61 @@
+apiVersion: pipeline.io/v1
+kind: PipelineJob
+metadata:
+  name: stage-1
+  namespace: default
+spec:
+  priority: realtime
+  requestCPU: "200m"
+  requestMemory: "256Mi"
+  storageMarker: "s3://test-bucket/stage1/_SUCCESS"
+  timeoutSeconds: 600
+  jobDurationSeconds: 30
+  stage: "1"
+  dependencies: []
+---
+apiVersion: pipeline.io/v1
+kind: PipelineJob
+metadata:
+  name: stage-2
+  namespace: default
+spec:
+  priority: realtime
+  requestCPU: "200m"
+  requestMemory: "256Mi"
+  storageMarker: "s3://test-bucket/stage2/_SUCCESS"
+  timeoutSeconds: 600
+  jobDurationSeconds: 45
+  stage: "2"
+  dependencies:
+    - stage-1
+---
+apiVersion: pipeline.io/v1
+kind: PipelineJob
+metadata:
+  name: stage-3
+  namespace: default
+spec:
+  priority: realtime
+  requestCPU: "200m"
+  requestMemory: "256Mi"
+  storageMarker: "s3://test-bucket/stage3/_SUCCESS"
+  timeoutSeconds: 600
+  jobDurationSeconds: 20
+  stage: "3"
+  dependencies:
+    - stage-2
+---
+apiVersion: pipeline.io/v1
+kind: PipelineJob
+metadata:
+  name: background-1
+  namespace: default
+spec:
+  priority: batch
+  requestCPU: "1000m"
+  requestMemory: "1Gi"
+  storageMarker: "s3://test-bucket/bg1/_SUCCESS"
+  timeoutSeconds: 600
+  jobDurationSeconds: 60
+  stage: "background"
+  dependencies: []

@@ -1,0 +1,38 @@
+apiVersion: pipeline.io/v1
+kind: PipelineJob
+metadata:
+  name: batch-hog-1
+  namespace: default
+spec:
+  priority: batch
+  requestCPU: "3000m"
+  requestMemory: "4Gi"
+  storageMarker: "s3://test-bucket/hog1/_SUCCESS"
+  timeoutSeconds: 300
+  dependencies: []
+---
+apiVersion: pipeline.io/v1
+kind: PipelineJob
+metadata:
+  name: batch-hog-2
+  namespace: default
+spec:
+  priority: batch
+  requestCPU: "3000m"
+  requestMemory: "4Gi"
+  storageMarker: "s3://test-bucket/hog2/_SUCCESS"
+  timeoutSeconds: 300
+  dependencies: []
+---
+apiVersion: pipeline.io/v1
+kind: PipelineJob
+metadata:
+  name: realtime-urgent
+  namespace: default
+spec:
+  priority: realtime
+  requestCPU: "3000m"
+  requestMemory: "4Gi"
+  storageMarker: "s3://test-bucket/urgent/_SUCCESS"
+  timeoutSeconds: 300
+  dependencies: []
