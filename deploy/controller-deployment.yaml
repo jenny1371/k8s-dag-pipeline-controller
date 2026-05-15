@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dag-pipeline-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dag-pipeline-controller
+  template:
+    metadata:
+      labels:
+        app: dag-pipeline-controller
+    spec:
+      serviceAccountName: pipeline-controller
+      containers:
+      - name: controller
+        image: dag-pipeline-controller:latest
+        imagePullPolicy: IfNotPresent
