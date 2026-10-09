@@ -11,6 +11,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -167,6 +168,24 @@ func (r *PipelineJobReconciler) handleRunning(ctx context.Context, job *pipeline
 		return reconcile.Result{}, nil
 	}
 
+	// SUBMITTED -> RUNNING once the underlying K8s Job has an active pod.
+	// LastUpdated is left untouched so the timeout still counts from submission.
+	if job.Status.State == pipelinev1.StateSubmitted {
+		underlying := &batchv1.Job{}
+		err := r.Get(ctx, types.NamespacedName{Name: "job-" + job.Name, Namespace: job.Namespace}, underlying)
+		if err == nil && underlying.Status.Active > 0 {
+			job.Status.State = pipelinev1.StateRunning
+			ctrl.Log.Info("job_event", "job", job.Name, "event", "RUNNING", "ts", time.Now().UnixMilli())
+			if err := r.Status().Update(ctx, job); err != nil {
+				return reconcile.Result{RequeueAfter: time.Second}, err
+			}
+			return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		if err != nil && client.IgnoreNotFound(err) != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
 	startTime, _ := time.Parse(time.RFC3339, job.Status.LastUpdated)
 	timeout := DefaultTimeout
 	if job.Spec.TimeoutSeconds > 0 {
@@ -202,18 +221,20 @@ func (r *PipelineJobReconciler) handleKilling(ctx context.Context, job *pipeline
 		ctrl.Log.Error(err, "delete underlying job in killing state failed", "job", job.Name)
 	}
 
-	if time.Since(killTime) > KillConfirmTimeout {
+	// Re-queue once the kill is confirmed, or after KillConfirmTimeout at the latest.
+	confirmed, err := r.Eviction.ConfirmKilled(ctx, job)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if confirmed || time.Since(killTime) > KillConfirmTimeout {
 		job.Status.State = pipelinev1.StateWaiting
 		job.Status.LastUpdated = time.Now().Format(time.RFC3339)
-		ctrl.Log.Info("job_event", "job", job.Name, "event", "KILL_CONFIRMED", "ts", time.Now().UnixMilli())
+		ctrl.Log.Info("job_event", "job", job.Name, "event", "KILL_CONFIRMED", "confirmed", confirmed, "ts", time.Now().UnixMilli())
 		if err := r.Status().Update(ctx, job); err != nil {
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	if err := r.Eviction.ConfirmKilled(ctx, job); err != nil {
-		return reconcile.Result{}, err
 	}
 
 	return reconcile.Result{RequeueAfter: 5 * time.Second}, nil

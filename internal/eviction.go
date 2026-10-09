@@ -6,6 +6,7 @@ import (
 
 	pipelinev1 "pipeline-controller/api/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -65,11 +66,29 @@ func (e *EvictionManager) Evict(ctx context.Context, job *pipelinev1.PipelineJob
 	return e.client.Status().Update(ctx, job)
 }
 
-// ConfirmKilled Verify job ， WAITING
-// evictionCount reset，Completed reset（ reconciler.go handleRunning）
-func (e *EvictionManager) ConfirmKilled(ctx context.Context, job *pipelinev1.PipelineJob) error {
-	job.Status.State = pipelinev1.StateWaiting
-	return e.client.Status().Update(ctx, job)
+// ConfirmKilled reports whether the underlying K8s Job and all of its pods are gone.
+// The caller moves the job back to WAITING once this returns true, or after
+// KillConfirmTimeout has elapsed.
+// evictionCount is not reset here; it is reset when the job completes (see reconciler.go handleRunning).
+func (e *EvictionManager) ConfirmKilled(ctx context.Context, job *pipelinev1.PipelineJob) (bool, error) {
+	jobName := "job-" + job.Name
+
+	err := e.client.Get(ctx, types.NamespacedName{Name: jobName, Namespace: job.Namespace}, &batchv1.Job{})
+	if err == nil {
+		return false, nil
+	}
+	if client.IgnoreNotFound(err) != nil {
+		return false, err
+	}
+
+	pods := &corev1.PodList{}
+	if err := e.client.List(ctx, pods,
+		client.InNamespace(job.Namespace),
+		client.MatchingLabels{"job-name": jobName},
+	); err != nil {
+		return false, err
+	}
+	return len(pods.Items) == 0, nil
 }
 
 // ResetEvictionCount job Completed eviction ，Eviction
