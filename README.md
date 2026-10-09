@@ -38,7 +38,7 @@ PipelineJob CRD
  Reconciler (controller-runtime)
       │
       ├── DAGRegistry       — dependency graph, cycle detection
-      ├── AdmissionChecker  — node allocatable vs. in-flight usage
+      ├── AdmissionChecker  — per-node free capacity from real pod requests
       ├── EvictionManager   — batch job preemption for realtime priority
       └── StorageChecker    — S3/MinIO HeadObject marker polling
 ```
@@ -209,7 +209,7 @@ kubectl get pipelinejobs -w
 
 ### Eviction (`test-eviction.yaml`)
 
-Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests to your cluster). A `realtime` job waits for capacity; after `EvictionThreshold` (5s), the controller evicts a batch job to free resources. The evicted job sits in `KILLING` until its Kubernetes Job and pods are gone (or `KillConfirmTimeout` expires), then re-queues to `WAITING`.
+Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests to your cluster). A `realtime` job waits for capacity; after `EvictionThreshold` (5s), the controller evicts a batch job to free resources. The evicted job sits in `KILLING` until its Kubernetes Job and pods are gone (or `KillConfirmTimeout` expires), then re-queues to `WAITING`. While the realtime job is waiting, batch jobs leave room for it, so the freed capacity goes to the realtime job; no second eviction starts while one is still in progress.
 
 ---
 
