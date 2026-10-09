@@ -5,13 +5,13 @@ import (
 	"testing"
 	"time"
 
-	pipelinev1 "pipeline-controller/api/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	pipelinev1 "pipeline-controller/api/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -32,7 +32,7 @@ func newKillingFixture(t *testing.T, killedAgo time.Duration, withLingeringPod b
 		Status: pipelinev1.PipelineJobStatus{
 			State:         pipelinev1.StateKilling,
 			EvictionCount: 1,
-			LastUpdated:   time.Now().Add(-killedAgo).Format(time.RFC3339),
+			LastUpdated:   ago(killedAgo),
 		},
 	}
 	objs := []client.Object{job}
@@ -97,27 +97,57 @@ func TestHandleKilling(t *testing.T) {
 	}
 }
 
-func TestFindEvictionCandidate_NoSecondEvictionWhileOneIsInProgress(t *testing.T) {
-	running := &pipelinev1.PipelineJob{
-		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "default"},
-		Spec:       pipelinev1.PipelineJobSpec{Priority: pipelinev1.PriorityBatch},
-		Status:     pipelinev1.PipelineJobStatus{State: pipelinev1.StateRunning},
+func TestEligibleVictims(t *testing.T) {
+	batch := func(name, ns string, state pipelinev1.JobState) *pipelinev1.PipelineJob {
+		return &pipelinev1.PipelineJob{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       pipelinev1.PipelineJobSpec{Priority: pipelinev1.PriorityBatch},
+			Status:     pipelinev1.PipelineJobStatus{State: state},
+		}
 	}
-	killing := &pipelinev1.PipelineJob{
-		ObjectMeta: metav1.ObjectMeta{Name: "killing", Namespace: "default"},
-		Spec:       pipelinev1.PipelineJobSpec{Priority: pipelinev1.PriorityBatch},
-		Status:     pipelinev1.PipelineJobStatus{State: pipelinev1.StateKilling},
+	waiting := &pipelinev1.PipelineJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "urgent", Namespace: "default"},
+		Spec:       pipelinev1.PipelineJobSpec{Priority: pipelinev1.PriorityRealtime},
+	}
+	names := func(js []*pipelinev1.PipelineJob) []string {
+		var out []string
+		for _, j := range js {
+			out = append(out, j.Name)
+		}
+		return out
 	}
 
-	got, err := NewEvictionManager(newClient(t, running)).FindEvictionCandidate(context.Background())
-	if err != nil || got == nil || got.Name != "running" {
-		t.Fatalf("with no eviction in progress: got (%v, %v), want the running batch job", got, err)
-	}
+	t.Run("only running or submitted batch jobs in the same namespace", func(t *testing.T) {
+		maxed := batch("maxed", "default", pipelinev1.StateRunning)
+		maxed.Status.EvictionCount = MaxEvictionCount
+		rt := batch("rt", "default", pipelinev1.StateRunning)
+		rt.Spec.Priority = pipelinev1.PriorityRealtime
+		m := NewEvictionManager(newClient(t,
+			batch("a", "default", pipelinev1.StateRunning),
+			batch("b", "default", pipelinev1.StateSubmitted),
+			batch("waiting-batch", "default", pipelinev1.StateReady),
+			batch("other-namespace", "other", pipelinev1.StateRunning),
+			maxed, rt,
+		))
+		got, err := m.EligibleVictims(context.Background(), waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := names(got); len(n) != 2 || !((n[0] == "a" && n[1] == "b") || (n[0] == "b" && n[1] == "a")) {
+			t.Errorf("victims = %v, want [a b]", n)
+		}
+	})
 
-	got, err = NewEvictionManager(newClient(t, running, killing)).FindEvictionCandidate(context.Background())
-	if err != nil || got != nil {
-		t.Errorf("with a job already KILLING: got (%v, %v), want no candidate", got, err)
-	}
+	t.Run("no second eviction while one is in progress", func(t *testing.T) {
+		m := NewEvictionManager(newClient(t,
+			batch("running", "default", pipelinev1.StateRunning),
+			batch("killing", "default", pipelinev1.StateKilling),
+		))
+		got, err := m.EligibleVictims(context.Background(), waiting)
+		if err != nil || len(got) != 0 {
+			t.Errorf("got (%v, %v), want no victims while a job is KILLING", names(got), err)
+		}
+	})
 }
 
 func TestConfirmKilled_JobStillExists(t *testing.T) {
@@ -138,3 +168,8 @@ func TestConfirmKilled_JobStillExists(t *testing.T) {
 	}
 }
 
+// ago returns a status timestamp d in the past.
+func ago(d time.Duration) *metav1.Time {
+	t := metav1.NewTime(time.Now().Add(-d))
+	return &t
+}

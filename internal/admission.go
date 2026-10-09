@@ -11,12 +11,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// AdmissionChecker decides whether a job fits on the cluster. It takes a
+// client.Reader rather than the cached client: pass the manager's API reader so
+// that a job submitted a moment ago is already visible and admission cannot
+// over-commit on stale cache data.
 type AdmissionChecker struct {
-	client client.Client
+	reader client.Reader
 }
 
-func NewAdmissionChecker(c client.Client) *AdmissionChecker {
-	return &AdmissionChecker{client: c}
+func NewAdmissionChecker(r client.Reader) *AdmissionChecker {
+	return &AdmissionChecker{reader: r}
 }
 
 // resources is a CPU (millicores) and memory (bytes) amount.
@@ -35,6 +39,29 @@ type nodeFree struct {
 	free resources
 }
 
+// snapshot is a consistent view of the cluster state admission decisions are based on.
+type snapshot struct {
+	nodes []corev1.Node
+	pods  []corev1.Pod
+	jobs  []pipelinev1.PipelineJob
+}
+
+func (a *AdmissionChecker) snapshot(ctx context.Context) (*snapshot, error) {
+	nodeList := &corev1.NodeList{}
+	if err := a.reader.List(ctx, nodeList); err != nil {
+		return nil, err
+	}
+	podList := &corev1.PodList{}
+	if err := a.reader.List(ctx, podList); err != nil {
+		return nil, err
+	}
+	jobList := &pipelinev1.PipelineJobList{}
+	if err := a.reader.List(ctx, jobList); err != nil {
+		return nil, err
+	}
+	return &snapshot{nodes: nodeList.Items, pods: podList.Items, jobs: jobList.Items}, nil
+}
+
 // HasCapacity reports whether a single node can still fit the job's request.
 // It uses the real cluster state: each node's allocatable minus the requests of
 // every non-terminated pod already bound to it (so non-PipelineJob workloads
@@ -50,27 +77,74 @@ func (a *AdmissionChecker) HasCapacity(ctx context.Context, job *pipelinev1.Pipe
 	if err != nil {
 		return false, err
 	}
-
-	nodeList := &corev1.NodeList{}
-	if err := a.client.List(ctx, nodeList); err != nil {
-		return false, err
-	}
-	podList := &corev1.PodList{}
-	if err := a.client.List(ctx, podList); err != nil {
-		return false, err
-	}
-	jobList := &pipelinev1.PipelineJobList{}
-	if err := a.client.List(ctx, jobList); err != nil {
+	snap, err := a.snapshot(ctx)
+	if err != nil {
 		return false, err
 	}
 
-	nodes := freeCapacityPerNode(nodeList.Items, podList.Items)
-	pending := pendingRequests(podList.Items, jobList.Items)
+	nodes := freeCapacityPerNode(snap.nodes, snap.pods)
+	pending := pendingRequests(snap.pods, snap.jobs)
 	if job.Spec.Priority == pipelinev1.PriorityBatch {
-		pending = append(pending, waitingRealtimeRequests(job, jobList.Items)...)
+		pending = append(pending, waitingRealtimeRequests(job, snap.jobs)...)
 	}
 
 	return fitsOnSomeNode(nodes, pending, need), nil
+}
+
+// PickVictim chooses which job to evict so that the waiting job fits. A victim
+// is only acceptable if, with its pod gone, the waiting job would fit on a
+// single node; evicting anything else would kill work without helping. Among the
+// acceptable victims the one holding the least resources is chosen, to waste as
+// little work as possible. It returns nil when no single eviction would help.
+func (a *AdmissionChecker) PickVictim(ctx context.Context, waiting *pipelinev1.PipelineJob, victims []*pipelinev1.PipelineJob) (*pipelinev1.PipelineJob, error) {
+	need, err := parseRequest(waiting.Spec.RequestCPU, waiting.Spec.RequestMemory)
+	if err != nil {
+		return nil, err
+	}
+	snap, err := a.snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var best *pipelinev1.PipelineJob
+	var bestSize resources
+	for _, v := range victims {
+		size, err := parseRequest(v.Spec.RequestCPU, v.Spec.RequestMemory)
+		if err != nil {
+			continue
+		}
+		if !fitsAfterRemoving(snap, v, need) {
+			continue
+		}
+		if best == nil || size.milliCPU < bestSize.milliCPU ||
+			(size.milliCPU == bestSize.milliCPU && size.memory < bestSize.memory) {
+			best, bestSize = v, size
+		}
+	}
+	return best, nil
+}
+
+// fitsAfterRemoving simulates evicting the victim (its pods and its in-flight
+// claim disappear) and checks whether need then fits on one node.
+func fitsAfterRemoving(snap *snapshot, victim *pipelinev1.PipelineJob, need resources) bool {
+	victimJob := "job-" + victim.Name
+
+	pods := make([]corev1.Pod, 0, len(snap.pods))
+	for _, p := range snap.pods {
+		if p.Namespace == victim.Namespace && p.Labels["job-name"] == victimJob {
+			continue
+		}
+		pods = append(pods, p)
+	}
+	jobs := make([]pipelinev1.PipelineJob, 0, len(snap.jobs))
+	for _, j := range snap.jobs {
+		if j.Namespace == victim.Namespace && j.Name == victim.Name {
+			continue
+		}
+		jobs = append(jobs, j)
+	}
+
+	return fitsOnSomeNode(freeCapacityPerNode(snap.nodes, pods), pendingRequests(pods, jobs), need)
 }
 
 // waitingRealtimeRequests returns the requests of READY realtime jobs (other

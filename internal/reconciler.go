@@ -55,6 +55,10 @@ func NewWorkerConfigFromEnv() WorkerConfig {
 
 type PipelineJobReconciler struct {
 	client.Client
+	// APIReader reads straight from the API server, bypassing the informer cache.
+	// It is used where a stale read would be harmful (checking whether the worker
+	// Job already exists). When nil, the cached client is used.
+	APIReader   client.Reader
 	DAG         *DAGRegistry
 	Admission   *AdmissionChecker
 	Eviction    *EvictionManager
@@ -63,10 +67,30 @@ type PipelineJobReconciler struct {
 	admissionMu sync.Mutex
 }
 
+func (r *PipelineJobReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 // jobKey namespaces a job name so same-named jobs in different namespaces
 // do not collide in the DAG registry.
 func jobKey(namespace, name string) string {
 	return namespace + "/" + name
+}
+
+func nowTime() *metav1.Time {
+	t := metav1.Now()
+	return &t
+}
+
+// since returns how long ago t was, or 0 when it is unset.
+func since(t *metav1.Time) time.Duration {
+	if t == nil {
+		return 0
+	}
+	return time.Since(t.Time)
 }
 
 func (r *PipelineJobReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -84,7 +108,9 @@ func (r *PipelineJobReconciler) Reconcile(ctx context.Context, req reconcile.Req
 	ctrl.Log.Info("reconciling", "job", job.Name, "state", job.Status.State)
 
 	switch job.Status.State {
-	case "", pipelinev1.StateWaiting:
+	case "":
+		return r.initialize(ctx, job)
+	case pipelinev1.StateWaiting:
 		return r.handleWaiting(ctx, job)
 	case pipelinev1.StateReady:
 		return r.handleReady(ctx, job)
@@ -99,12 +125,23 @@ func (r *PipelineJobReconciler) Reconcile(ctx context.Context, req reconcile.Req
 	return reconcile.Result{}, nil
 }
 
+// initialize gives a brand-new job an explicit WAITING state so that
+// `kubectl get pipelinejobs` never shows an empty STATE column.
+func (r *PipelineJobReconciler) initialize(ctx context.Context, job *pipelinev1.PipelineJob) (reconcile.Result, error) {
+	job.Status.State = pipelinev1.StateWaiting
+	job.Status.LastUpdated = nowTime()
+	if err := r.Status().Update(ctx, job); err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{Requeue: true}, nil
+}
+
 // fail moves the job to the terminal FAILED state and records why.
 func (r *PipelineJobReconciler) fail(ctx context.Context, job *pipelinev1.PipelineJob, reason string) (reconcile.Result, error) {
 	ctrl.Log.Info("job_event", "job", job.Name, "event", "FAILED", "reason", reason, "ts", time.Now().UnixMilli())
 	job.Status.State = pipelinev1.StateFailed
 	job.Status.Reason = reason
-	job.Status.LastUpdated = time.Now().Format(time.RFC3339)
+	job.Status.LastUpdated = nowTime()
 	if err := r.Status().Update(ctx, job); err != nil {
 		return reconcile.Result{}, err
 	}
@@ -128,6 +165,25 @@ func validateSpec(job *pipelinev1.PipelineJob) error {
 	return nil
 }
 
+// waitingReason explains what a WAITING job is waiting for, e.g. a dependency
+// name with a typo that will never exist.
+func waitingReason(job *pipelinev1.PipelineJob, states map[string]pipelinev1.JobState) string {
+	for _, dep := range job.Spec.Dependencies {
+		state, ok := states[jobKey(job.Namespace, dep)]
+		if !ok {
+			return fmt.Sprintf("waiting: upstream job %q not found in namespace %q", dep, job.Namespace)
+		}
+		if state != pipelinev1.StateDone {
+			shown := string(state)
+			if shown == "" {
+				shown = string(pipelinev1.StateWaiting)
+			}
+			return fmt.Sprintf("waiting for upstream job %q (%s)", dep, shown)
+		}
+	}
+	return ""
+}
+
 func (r *PipelineJobReconciler) handleWaiting(ctx context.Context, job *pipelinev1.PipelineJob) (reconcile.Result, error) {
 	if err := validateSpec(job); err != nil {
 		ctrl.Log.Error(err, "invalid job spec", "job", job.Name)
@@ -146,27 +202,42 @@ func (r *PipelineJobReconciler) handleWaiting(ctx context.Context, job *pipeline
 		return r.fail(ctx, job, err.Error())
 	}
 
-	doneSet, failedSet, err := r.buildStateSets(ctx)
+	states, err := r.listStates(ctx)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
 	// A failed upstream will never become DONE, so fail instead of waiting forever.
 	for i, dep := range deps {
-		if failedSet[dep] {
+		if states[dep] == pipelinev1.StateFailed {
 			return r.fail(ctx, job, fmt.Sprintf("upstream job %q failed", job.Spec.Dependencies[i]))
+		}
+	}
+
+	doneSet := make(map[string]bool)
+	for k, s := range states {
+		if s == pipelinev1.StateDone {
+			doneSet[k] = true
 		}
 	}
 
 	if r.DAG.AllUpstreamDone(key, doneSet) {
 		job.Status.State = pipelinev1.StateReady
 		job.Status.Reason = ""
-		job.Status.LastUpdated = time.Now().Format(time.RFC3339)
+		job.Status.LastUpdated = nowTime()
 		ctrl.Log.Info("job_event", "job", job.Name, "event", "READY", "ts", time.Now().UnixMilli())
 		if err := r.Status().Update(ctx, job); err != nil {
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{Requeue: true}, nil
+	}
+
+	// Still waiting: say what for (and flag upstreams that do not exist).
+	if reason := waitingReason(job, states); reason != job.Status.Reason {
+		job.Status.Reason = reason
+		if err := r.Status().Update(ctx, job); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 
 	return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
@@ -188,19 +259,14 @@ func (r *PipelineJobReconciler) handleReady(ctx context.Context, job *pipelinev1
 	}
 
 	if ok {
-		// Remove any marker left by a previous run (re-applied pipeline, retry) so
-		// it cannot make this run look finished.
-		if err := r.Storage.ClearMarker(ctx, job.Spec.StorageMarker); err != nil {
-			return reconcile.Result{}, err
-		}
-
 		ctrl.Log.Info("creating underlying job", "job", job.Name)
-		if err := r.createUnderlyingJob(ctx, job); err != nil {
+		if err := r.ensureUnderlyingJob(ctx, job); err != nil {
 			ctrl.Log.Error(err, "failed to create underlying job", "job", job.Name)
 			return reconcile.Result{}, err
 		}
 		job.Status.State = pipelinev1.StateSubmitted
-		job.Status.LastUpdated = time.Now().Format(time.RFC3339)
+		job.Status.Reason = ""
+		job.Status.LastUpdated = nowTime()
 		ctrl.Log.Info("job_event", "job", job.Name, "event", "SUBMITTED", "ts", time.Now().UnixMilli())
 		if err := r.Status().Update(ctx, job); err != nil {
 			return reconcile.Result{}, err
@@ -208,33 +274,39 @@ func (r *PipelineJobReconciler) handleReady(ctx context.Context, job *pipelinev1
 		return reconcile.Result{}, nil
 	}
 
-	if job.Spec.Priority == pipelinev1.PriorityRealtime {
-		waitSince, err := time.Parse(time.RFC3339, job.Status.LastUpdated)
-		if err != nil {
-			ctrl.Log.Info("waitSince parse error", "job", job.Name, "lastUpdated", job.Status.LastUpdated, "err", err)
-		} else {
-			waited := time.Since(waitSince)
-			ctrl.Log.Info("eviction check", "job", job.Name, "waited", waited, "threshold", EvictionThreshold, "shouldEvict", ShouldEvict(waitSince))
-			if ShouldEvict(waitSince) {
-				candidate, err := r.Eviction.FindEvictionCandidate(ctx)
-				if err != nil {
-					return reconcile.Result{}, err
-				}
-				if candidate != nil {
-					ctrl.Log.Info("evicting", "candidate", candidate.Name)
-					ctrl.Log.Info("job_event", "job", candidate.Name, "event", "EVICTED", "ts", time.Now().UnixMilli())
-					// Evict deletes the K8s Job and moves the candidate to KILLING.
-					if err := r.Eviction.Evict(ctx, candidate); err != nil {
-						return reconcile.Result{}, err
-					}
-				} else {
-					ctrl.Log.Info("no eviction candidate found")
-				}
+	if job.Spec.Priority == pipelinev1.PriorityRealtime && job.Status.LastUpdated != nil {
+		waited := since(job.Status.LastUpdated)
+		ctrl.Log.Info("eviction check", "job", job.Name, "waited", waited, "threshold", EvictionThreshold, "shouldEvict", ShouldEvict(job.Status.LastUpdated.Time))
+		if ShouldEvict(job.Status.LastUpdated.Time) {
+			if err := r.evictFor(ctx, job); err != nil {
+				return reconcile.Result{}, err
 			}
 		}
 	}
 
 	return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
+}
+
+// evictFor preempts a batch job on behalf of a waiting realtime job, but only a
+// victim whose removal actually lets the realtime job fit on a node.
+func (r *PipelineJobReconciler) evictFor(ctx context.Context, waiting *pipelinev1.PipelineJob) error {
+	victims, err := r.Eviction.EligibleVictims(ctx, waiting)
+	if err != nil {
+		return err
+	}
+	victim, err := r.Admission.PickVictim(ctx, waiting, victims)
+	if err != nil {
+		return err
+	}
+	if victim == nil {
+		ctrl.Log.Info("no eviction would make room", "job", waiting.Name, "candidates", len(victims))
+		return nil
+	}
+
+	ctrl.Log.Info("evicting", "candidate", victim.Name, "for", waiting.Name)
+	ctrl.Log.Info("job_event", "job", victim.Name, "event", "EVICTED", "ts", time.Now().UnixMilli())
+	// Evict deletes the K8s Job and moves the victim to KILLING.
+	return r.Eviction.Evict(ctx, victim)
 }
 
 // underlyingJobFailed reports whether the batch Job has terminally failed.
@@ -250,10 +322,11 @@ func underlyingJobFailed(j *batchv1.Job) bool {
 // retryOrFail deletes the underlying Job and either schedules a retry
 // (TIMED_OUT -> WAITING) or, once RetryBudget is used up, fails permanently.
 func (r *PipelineJobReconciler) retryOrFail(ctx context.Context, job *pipelinev1.PipelineJob, reason string) (reconcile.Result, error) {
-	// Delete the K8s Job so a zombie job does not keep holding resources.
+	// The Job must really be gone before the job is retried, otherwise the retry
+	// could adopt the old, failed Job instead of starting a fresh one.
 	if err := r.Eviction.DeleteUnderlyingJob(ctx, job); err != nil {
 		ctrl.Log.Error(err, "failed to delete underlying job", "job", job.Name)
-		// Not fatal: keep going and record the state change.
+		return reconcile.Result{}, err
 	}
 
 	if job.Status.RetryCount < RetryBudget {
@@ -262,7 +335,7 @@ func (r *PipelineJobReconciler) retryOrFail(ctx context.Context, job *pipelinev1
 		job.Status.State = pipelinev1.StateFailed
 	}
 	job.Status.Reason = reason
-	job.Status.LastUpdated = time.Now().Format(time.RFC3339)
+	job.Status.LastUpdated = nowTime()
 	ctrl.Log.Info("job_event", "job", job.Name, "event", string(job.Status.State), "reason", reason, "ts", time.Now().UnixMilli())
 	if err := r.Status().Update(ctx, job); err != nil {
 		return reconcile.Result{}, err
@@ -288,7 +361,7 @@ func (r *PipelineJobReconciler) handleRunning(ctx context.Context, job *pipeline
 		ctrl.Log.Info("job_event", "job", latest.Name, "event", "DONE", "ts", time.Now().UnixMilli())
 		latest.Status.State = pipelinev1.StateDone
 		latest.Status.Reason = ""
-		latest.Status.LastUpdated = time.Now().Format(time.RFC3339)
+		latest.Status.LastUpdated = nowTime()
 		latest.Status.EvictionCount = 0
 		if err := r.Status().Update(ctx, latest); err != nil {
 			return reconcile.Result{RequeueAfter: time.Second}, err
@@ -318,13 +391,22 @@ func (r *PipelineJobReconciler) handleRunning(ctx context.Context, job *pipeline
 		return reconcile.Result{}, err
 	}
 
-	startTime, _ := time.Parse(time.RFC3339, job.Status.LastUpdated)
+	// Without a timestamp there is nothing to measure the timeout from; stamp it
+	// now rather than treating the job as instantly overdue.
+	if job.Status.LastUpdated == nil {
+		job.Status.LastUpdated = nowTime()
+		if err := r.Status().Update(ctx, job); err != nil {
+			return reconcile.Result{}, err
+		}
+		return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
 	timeout := DefaultTimeout
 	if job.Spec.TimeoutSeconds > 0 {
 		timeout = time.Duration(job.Spec.TimeoutSeconds) * time.Second
 	}
 
-	if time.Since(startTime) > timeout {
+	if since(job.Status.LastUpdated) > timeout {
 		return r.retryOrFail(ctx, job, "timed out")
 	}
 
@@ -332,8 +414,6 @@ func (r *PipelineJobReconciler) handleRunning(ctx context.Context, job *pipeline
 }
 
 func (r *PipelineJobReconciler) handleKilling(ctx context.Context, job *pipelinev1.PipelineJob) (reconcile.Result, error) {
-	killTime, _ := time.Parse(time.RFC3339, job.Status.LastUpdated)
-
 	// Delete the K8s Job (a no-op if Evict already removed it).
 	if err := r.Eviction.DeleteUnderlyingJob(ctx, job); err != nil {
 		ctrl.Log.Error(err, "delete underlying job in killing state failed", "job", job.Name)
@@ -345,9 +425,9 @@ func (r *PipelineJobReconciler) handleKilling(ctx context.Context, job *pipeline
 		return reconcile.Result{}, err
 	}
 
-	if confirmed || time.Since(killTime) > KillConfirmTimeout {
+	if confirmed || since(job.Status.LastUpdated) > KillConfirmTimeout {
 		job.Status.State = pipelinev1.StateWaiting
-		job.Status.LastUpdated = time.Now().Format(time.RFC3339)
+		job.Status.LastUpdated = nowTime()
 		ctrl.Log.Info("job_event", "job", job.Name, "event", "KILL_CONFIRMED", "confirmed", confirmed, "ts", time.Now().UnixMilli())
 		if err := r.Status().Update(ctx, job); err != nil {
 			return reconcile.Result{}, err
@@ -361,31 +441,66 @@ func (r *PipelineJobReconciler) handleKilling(ctx context.Context, job *pipeline
 func (r *PipelineJobReconciler) handleTimedOut(ctx context.Context, job *pipelinev1.PipelineJob) (reconcile.Result, error) {
 	job.Status.RetryCount++
 	job.Status.State = pipelinev1.StateWaiting
-	job.Status.LastUpdated = time.Now().Format(time.RFC3339)
+	job.Status.LastUpdated = nowTime()
 	if err := r.Status().Update(ctx, job); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
 }
 
-// buildStateSets returns the namespaced keys of all DONE and all FAILED jobs.
-func (r *PipelineJobReconciler) buildStateSets(ctx context.Context) (done, failed map[string]bool, err error) {
+// listStates returns the state of every PipelineJob, keyed by namespace/name.
+func (r *PipelineJobReconciler) listStates(ctx context.Context) (map[string]pipelinev1.JobState, error) {
 	jobList := &pipelinev1.PipelineJobList{}
 	if err := r.List(ctx, jobList); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	done = make(map[string]bool)
-	failed = make(map[string]bool)
+	states := make(map[string]pipelinev1.JobState, len(jobList.Items))
 	for _, j := range jobList.Items {
-		switch j.Status.State {
-		case pipelinev1.StateDone:
-			done[jobKey(j.Namespace, j.Name)] = true
-		case pipelinev1.StateFailed:
-			failed[jobKey(j.Namespace, j.Name)] = true
-		}
+		states[jobKey(j.Namespace, j.Name)] = j.Status.State
 	}
-	return done, failed, nil
+	return states, nil
+}
+
+// ensureUnderlyingJob makes sure the worker Job for this run exists.
+//
+//   - A live Job already owned by this PipelineJob (created by an earlier attempt
+//     whose status update failed) is adopted as is. The marker is NOT cleared in
+//     that case: the worker may already have finished and written it.
+//   - Otherwise any stale marker from an earlier run is cleared and a new Job is created.
+func (r *PipelineJobReconciler) ensureUnderlyingJob(ctx context.Context, job *pipelinev1.PipelineJob) error {
+	existing := &batchv1.Job{}
+	err := r.reader().Get(ctx, types.NamespacedName{Name: "job-" + job.Name, Namespace: job.Namespace}, existing)
+	switch {
+	case err == nil:
+		return r.checkExistingJob(ctx, job, existing)
+	case !apierrors.IsNotFound(err):
+		return err
+	}
+
+	// No Job yet: drop any marker left by a previous run (re-applied pipeline,
+	// retry) so it cannot make this run look finished.
+	if err := r.Storage.ClearMarker(ctx, job.Spec.StorageMarker); err != nil {
+		return err
+	}
+	return r.createUnderlyingJob(ctx, job)
+}
+
+// checkExistingJob decides what to do with a Job that already has our name: one
+// that is still terminating or that belongs to an older PipelineJob with the
+// same name must not be reused, so ask for a retry once it is gone.
+func (r *PipelineJobReconciler) checkExistingJob(ctx context.Context, job *pipelinev1.PipelineJob, existing *batchv1.Job) error {
+	if existing.DeletionTimestamp != nil {
+		return fmt.Errorf("previous underlying job %q is still terminating", existing.Name)
+	}
+	if !metav1.IsControlledBy(existing, job) {
+		propagation := metav1.DeletePropagationBackground
+		if err := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		return fmt.Errorf("removed stale underlying job %q left by an earlier PipelineJob, retrying", existing.Name)
+	}
+	return nil
 }
 
 func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pipelinev1.PipelineJob) error {
@@ -453,36 +568,9 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 		return err
 	}
 
-	err = r.Create(ctx, underlyingJob)
-	if apierrors.IsAlreadyExists(err) {
-		return r.checkExistingJob(ctx, job)
-	}
-	return err
-}
-
-// checkExistingJob decides what to do when the underlying Job name is taken:
-// a Job that is still terminating or that belongs to an older PipelineJob with
-// the same name must not be reused, so ask for a retry once it is gone.
-func (r *PipelineJobReconciler) checkExistingJob(ctx context.Context, job *pipelinev1.PipelineJob) error {
-	existing := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Name: "job-" + job.Name, Namespace: job.Namespace}, existing)
-	if apierrors.IsNotFound(err) {
-		return fmt.Errorf("underlying job %q vanished while being created, retrying", "job-"+job.Name)
-	}
-	if err != nil {
-		return err
-	}
-	if existing.DeletionTimestamp != nil {
-		return fmt.Errorf("previous underlying job %q is still terminating", existing.Name)
-	}
-	if !metav1.IsControlledBy(existing, job) {
-		propagation := metav1.DeletePropagationBackground
-		if err := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !apierrors.IsNotFound(err) {
-			return err
-		}
-		return fmt.Errorf("removed stale underlying job %q left by an earlier PipelineJob, retrying", existing.Name)
-	}
-	return nil
+	// AlreadyExists here means another reconcile created the Job between our
+	// check and this call; return the error so the next attempt re-checks it.
+	return r.Create(ctx, underlyingJob)
 }
 
 func (r *PipelineJobReconciler) SetupWithManager(mgr ctrl.Manager) error {

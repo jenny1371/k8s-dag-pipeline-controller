@@ -30,7 +30,7 @@ func pj(name string, state pipelinev1.JobState, deps ...string) *pipelinev1.Pipe
 		},
 		Status: pipelinev1.PipelineJobStatus{
 			State:       state,
-			LastUpdated: time.Now().Format(time.RFC3339),
+			LastUpdated: ago(0),
 		},
 	}
 }
@@ -357,7 +357,7 @@ func TestHandleRunning_FailedWorkerRetriesThenFails(t *testing.T) {
 func TestHandleRunning_TimeoutRetries(t *testing.T) {
 	j := pj("x", pipelinev1.StateRunning)
 	j.Spec.TimeoutSeconds = 10
-	j.Status.LastUpdated = time.Now().Add(-time.Minute).Format(time.RFC3339)
+	j.Status.LastUpdated = ago(time.Minute)
 	r, c, _ := newTestReconciler(t, j)
 
 	if _, err := r.handleRunning(context.Background(), get(t, c, "x")); err != nil {

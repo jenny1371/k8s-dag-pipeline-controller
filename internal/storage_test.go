@@ -103,10 +103,10 @@ func TestEndpointFromEnv(t *testing.T) {
 
 func TestParseS3Path(t *testing.T) {
 	tests := []struct {
-		in         string
-		bucket     string
-		key        string
-		wantErr    bool
+		in      string
+		bucket  string
+		key     string
+		wantErr bool
 	}{
 		{"s3://test-bucket/stage1/_SUCCESS", "test-bucket", "stage1/_SUCCESS", false},
 		{"s3://other/a", "other", "a", false},
