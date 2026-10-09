@@ -29,9 +29,13 @@ spec:
       labels:
         app: minio
     spec:
+      securityContext:
+        runAsUser: 0
       containers:
         - name: minio
-          image: minio/minio:latest
+          # minio/minio is no longer published on Docker Hub; this is a frozen Bitnami build of MinIO.
+          image: bitnamilegacy/minio:latest
+          command: ["minio"]
           args:
             - server
             - /data

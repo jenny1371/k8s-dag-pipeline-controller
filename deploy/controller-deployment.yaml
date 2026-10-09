@@ -17,3 +17,6 @@ spec:
       - name: controller
         image: dag-pipeline-controller:latest
         imagePullPolicy: IfNotPresent
+        env:
+        - name: MINIO_ENDPOINT
+          value: http://minio.minio:9000

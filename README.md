@@ -138,6 +138,16 @@ spec:
 kubectl apply -f config/minio.yaml
 ```
 
+> `minio/minio` is no longer published on Docker Hub, so `config/minio.yaml` uses the frozen `bitnamilegacy/minio` image. The worker image copies `mc` from `bitnamilegacy/minio-client`.
+
+Create the bucket once MinIO is up:
+
+```bash
+kubectl run mkbucket --rm -i --restart=Never --image=pipeline-job:latest --image-pull-policy=Never --command -- \
+  sh -c 'mc alias set s http://minio.minio:9000 minioadmin minioadmin && mc mb --ignore-existing s/test-bucket'
+```
+(run this after step 3 below, since it uses the worker image)
+
 ### 2. Apply CRD and RBAC
 
 ```bash
