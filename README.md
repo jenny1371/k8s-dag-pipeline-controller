@@ -75,6 +75,7 @@ KILLING ──► WAITING  (eviction recovery)
 │   ├── admission.go    # AdmissionChecker (CPU/memory capacity)
 │   ├── eviction.go     # EvictionManager (preemption, kill confirmation)
 │   ├── dag_test.go     # Unit tests: cycle detection, upstream resolution
+│   ├── eviction_test.go # Unit tests: KILLING -> WAITING, KillConfirmTimeout
 │   └── storage.go      # StorageChecker (S3/MinIO marker polling)
 ├── config/
 │   ├── job-image/
@@ -86,6 +87,7 @@ KILLING ──► WAITING  (eviction recovery)
 │   ├── test-pipeline.yaml       # DAG pipeline scenario
 │   ├── test-eviction.yaml       # Eviction scenario
 │   └── test-eviction-bench.yaml
+├── .github/workflows/ci.yaml   # go build / vet / test on every push
 ├── main.go
 ├── go.mod
 └── go.sum
@@ -132,39 +134,48 @@ spec:
 - `kubectl` configured
 - Docker (to build the worker image)
 
-### 1. Deploy MinIO (local S3 backend)
-
-```bash
-kubectl apply -f config/minio.yaml
-```
-
-> `minio/minio` is no longer published on Docker Hub, so `config/minio.yaml` uses the frozen `bitnamilegacy/minio` image. The worker image copies `mc` from `bitnamilegacy/minio-client`.
-
-Create the bucket once MinIO is up:
-
-```bash
-kubectl run mkbucket --rm -i --restart=Never --image=pipeline-job:latest --image-pull-policy=Never --command -- \
-  sh -c 'mc alias set s http://minio.minio:9000 minioadmin minioadmin && mc mb --ignore-existing s/test-bucket'
-```
-(run this after step 3 below, since it uses the worker image)
-
-### 2. Apply CRD and RBAC
+### 1. Apply CRD and RBAC
 
 ```bash
 kubectl apply -f config/crd.yaml
 kubectl apply -f config/rbac.yaml
 ```
 
-### 3. Build and load the worker image
+### 2. Build and load the images
 
 ```bash
-docker build -t pipeline-job:latest config/job-image/
+docker build -t pipeline-job:latest config/job-image/          # worker
+docker build -t dag-pipeline-controller:latest .               # controller
 kind load docker-image pipeline-job:latest
+kind load docker-image dag-pipeline-controller:latest
 ```
+
+> On Windows, `.gitattributes` keeps `run.sh` on LF line endings; without that the worker fails with `exec /run.sh: no such file or directory`.
+
+### 3. Deploy MinIO and create the bucket
+
+```bash
+kubectl apply -f config/minio.yaml
+kubectl -n minio rollout status deploy/minio
+
+kubectl run mkbucket --rm -i --restart=Never   --image=pipeline-job:latest --image-pull-policy=Never --command --   sh -c 'mc alias set s http://minio.minio:9000 minioadmin minioadmin && mc mb --ignore-existing s/test-bucket'
+```
+
+> `minio/minio` is no longer published on Docker Hub, so `config/minio.yaml` uses the frozen `bitnamilegacy/minio` image, and the worker image copies `mc` from `bitnamilegacy/minio-client`. Load the MinIO image into kind too if it cannot pull from Docker Hub.
 
 ### 4. Run the controller
 
+In the cluster (uses `MINIO_ENDPOINT=http://minio.minio:9000`):
+
 ```bash
+kubectl apply -f deploy/controller-deployment.yaml
+kubectl logs -f deploy/dag-pipeline-controller
+```
+
+Or locally, against a port-forwarded MinIO (default endpoint `http://localhost:9000`):
+
+```bash
+kubectl -n minio port-forward svc/minio 9000:9000 &
 go run main.go
 ```
 
@@ -194,7 +205,7 @@ kubectl get pipelinejobs -w
 
 ### Eviction (`test-eviction.yaml`)
 
-Two `batch` jobs saturate cluster CPU. A `realtime` job waits for capacity; after `EvictionThreshold` (5s), the controller evicts a batch job to free resources. The evicted job sits in `KILLING` until its Kubernetes Job and pods are gone (or `KillConfirmTimeout` expires), then re-queues to `WAITING`.
+Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests to your cluster). A `realtime` job waits for capacity; after `EvictionThreshold` (5s), the controller evicts a batch job to free resources. The evicted job sits in `KILLING` until its Kubernetes Job and pods are gone (or `KillConfirmTimeout` expires), then re-queues to `WAITING`.
 
 ---
 
