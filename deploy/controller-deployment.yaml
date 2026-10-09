@@ -13,10 +13,18 @@ spec:
         app: dag-pipeline-controller
     spec:
       serviceAccountName: pipeline-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
       containers:
       - name: controller
         image: dag-pipeline-controller:latest
         imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         env:
         - name: MINIO_ENDPOINT
           value: http://minio.minio:9000

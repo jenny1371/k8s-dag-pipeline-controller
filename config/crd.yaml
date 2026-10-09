@@ -14,12 +14,34 @@ spec:
     - name: v1
       served: true
       storage: true
+      additionalPrinterColumns:
+        - name: State
+          type: string
+          jsonPath: .status.state
+        - name: Priority
+          type: string
+          jsonPath: .spec.priority
+        - name: Retries
+          type: integer
+          jsonPath: .status.retryCount
+        - name: Evictions
+          type: integer
+          jsonPath: .status.evictionCount
+        - name: Reason
+          type: string
+          jsonPath: .status.reason
+          priority: 1
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
       schema:
         openAPIV3Schema:
           type: object
+          required: ["spec"]
           properties:
             spec:
               type: object
+              required: ["priority", "requestCPU", "requestMemory", "storageMarker"]
               properties:
                 dependencies:
                   type: array
@@ -30,14 +52,19 @@ spec:
                   enum: ["realtime", "batch"]
                 requestCPU:
                   type: string
+                  pattern: '^[0-9]+(\.[0-9]+)?m?$'
                 requestMemory:
                   type: string
+                  pattern: '^[0-9]+(\.[0-9]+)?([EPTGMK]i?)?$'
                 storageMarker:
                   type: string
+                  pattern: '^s3://[^/]+/.+'
                 timeoutSeconds:
                   type: integer
+                  minimum: 1
                 jobDurationSeconds:
                   type: integer
+                  minimum: 0
                 stage:
                   type: string
             status:
@@ -49,10 +76,9 @@ spec:
                   type: integer
                 retryCount:
                   type: integer
-                preemptible:
-                  type: boolean
                 lastUpdated:
                   type: string
+                  format: date-time
                 reason:
                   type: string
       subresources:

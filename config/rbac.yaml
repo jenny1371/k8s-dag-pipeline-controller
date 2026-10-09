@@ -10,10 +10,10 @@ kind: ClusterRole
 metadata:
   name: pipeline-controller-role
 rules:
-  # PipelineJob Resources
+  # PipelineJob objects are only read; state changes go through the status subresource.
   - apiGroups: ["pipeline.io"]
     resources: ["pipelinejobs"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["pipeline.io"]
     resources: ["pipelinejobs/status"]
     verbs: ["get", "update", "patch"]
@@ -22,32 +22,22 @@ rules:
     resources: ["pipelinejobs/finalizers"]
     verbs: ["update"]
 
-  # Node Resources（admission ）
+  # Admission control reads node allocatable capacity and the requests of running pods.
   - apiGroups: [""]
-    resources: ["nodes"]
+    resources: ["nodes", "pods"]
     verbs: ["get", "list", "watch"]
 
-  # Pod（eviction ）
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch", "delete"]
-
-  # batch Job
+  # The controller creates and deletes the worker Jobs (pods are removed by the Job controller).
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-
-  # SparkApplication
-  - apiGroups: ["sparkoperator.k8s.io"]
-    resources: ["sparkapplications"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch", "create", "delete"]
 
   # Leader election
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch", "create", "update"]
 
-  # Events（controller-runtime ）
+  # Events emitted by leader election
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
