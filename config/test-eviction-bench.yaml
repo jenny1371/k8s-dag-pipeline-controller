@@ -6,7 +6,7 @@ metadata:
 spec:
   priority: batch
   requestCPU: "3000m"
-  requestMemory: "4Gi"
+  requestMemory: "3Gi"
   storageMarker: "s3://test-bucket/hog1/_SUCCESS"
   timeoutSeconds: 300
   jobDurationSeconds: 120
@@ -21,7 +21,7 @@ metadata:
 spec:
   priority: batch
   requestCPU: "3000m"
-  requestMemory: "4Gi"
+  requestMemory: "3Gi"
   storageMarker: "s3://test-bucket/hog2/_SUCCESS"
   timeoutSeconds: 300
   jobDurationSeconds: 120
@@ -36,7 +36,7 @@ metadata:
 spec:
   priority: realtime
   requestCPU: "3000m"
-  requestMemory: "4Gi"
+  requestMemory: "3Gi"
   storageMarker: "s3://test-bucket/urgent/_SUCCESS"
   timeoutSeconds: 300
   jobDurationSeconds: 10

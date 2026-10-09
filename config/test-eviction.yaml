@@ -1,3 +1,7 @@
+# Eviction scenario: two batch jobs occupy 6 of 8 CPUs, then a realtime job
+# that cannot fit waits EvictionThreshold (5s) and evicts one of them.
+# Sized for a node with ~8 CPU / 8Gi allocatable (e.g. a default kind node on
+# an 8-CPU Docker VM); scale requestCPU/requestMemory to match your cluster.
 apiVersion: pipeline.io/v1
 kind: PipelineJob
 metadata:
@@ -6,9 +10,11 @@ metadata:
 spec:
   priority: batch
   requestCPU: "3000m"
-  requestMemory: "4Gi"
+  requestMemory: "3Gi"
   storageMarker: "s3://test-bucket/hog1/_SUCCESS"
   timeoutSeconds: 300
+  jobDurationSeconds: 120
+  stage: "background"
   dependencies: []
 ---
 apiVersion: pipeline.io/v1
@@ -19,9 +25,11 @@ metadata:
 spec:
   priority: batch
   requestCPU: "3000m"
-  requestMemory: "4Gi"
+  requestMemory: "3Gi"
   storageMarker: "s3://test-bucket/hog2/_SUCCESS"
   timeoutSeconds: 300
+  jobDurationSeconds: 120
+  stage: "background"
   dependencies: []
 ---
 apiVersion: pipeline.io/v1
@@ -32,7 +40,9 @@ metadata:
 spec:
   priority: realtime
   requestCPU: "3000m"
-  requestMemory: "4Gi"
+  requestMemory: "3Gi"
   storageMarker: "s3://test-bucket/urgent/_SUCCESS"
   timeoutSeconds: 300
+  jobDurationSeconds: 10
+  stage: "background"
   dependencies: []
