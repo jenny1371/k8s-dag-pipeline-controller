@@ -22,8 +22,10 @@ This controller acts as a **dependency-aware gatekeeper** between the orchestrat
 - **DAG dependency resolution** — jobs wait until all upstream jobs are `DONE` before becoming `READY`
 - **Cycle detection** — the DAG registry rejects any job spec that would create a cycle
 - **Admission control** — checks real, per-node free capacity (allocatable minus the requests of all running pods, including non-PipelineJob workloads) before submitting; the worker pods carry matching `resources.requests`, so the Kubernetes scheduler enforces the same numbers
-- **Priority eviction** — `realtime` jobs can preempt `batch` jobs when cluster capacity is exhausted; batch jobs leave room for waiting realtime jobs so freed capacity is not taken back
+- **Priority eviction** — a `realtime` job that cannot fit waits `EvictionThreshold`, then preempts a `batch` job in its namespace, but only one whose removal actually lets it fit on a single node (the smallest such job is chosen; if no single eviction would help, nothing is killed). Batch jobs leave room for waiting realtime jobs so the freed capacity is not taken back, and no second eviction starts while one is in progress
 - **Storage-marker completion** — jobs are marked `DONE` only when an S3/MinIO `_SUCCESS` marker is detected; stale markers are cleared before every run, and storage errors surface as errors instead of looking like "not finished"
+- **Visible state** — `kubectl get pipelinejobs` shows STATE, PRIORITY, RETRIES and EVICTIONS (`-o wide` adds REASON); a job that is waiting says what for, e.g. `waiting: upstream job "stge-1" not found`. A new job starts in `WAITING`, not blank
+- **Validation at the API** — the CRD requires `priority`, `requestCPU`, `requestMemory` and `storageMarker` and checks their format, so invalid specs are rejected by `kubectl apply` instead of failing later in the controller
 - **Failure handling** — a failing worker, a timeout, an invalid spec or a failed upstream moves the job to a retry or to `FAILED` with a `status.reason`
 - **Timeout & retry** — configurable per-job timeout with a retry budget before permanent failure
 
@@ -79,7 +81,7 @@ KILLING ──► WAITING  (eviction recovery)
 │   ├── eviction.go     # EvictionManager (preemption, kill confirmation)
 │   ├── dag_test.go     # Unit tests: cycle detection, upstream resolution
 │   ├── eviction_test.go # Unit tests: KILLING -> WAITING, KillConfirmTimeout
-│   ├── admission_test.go, storage_test.go, reconciler_test.go
+│   ├── admission_test.go, storage_test.go, reconciler_test.go, victim_test.go
 │   └── storage.go      # StorageChecker (S3/MinIO marker polling)
 ├── config/
 │   ├── job-image/
@@ -249,11 +251,15 @@ go test ./...
 ## Future Work
 
 - Admission only looks at CPU/memory requests and node taints. Node selectors, affinity, tolerations, ephemeral storage and GPUs are not considered, so a job can still be admitted and then sit `Pending` in the scheduler.
-- Priority-based eviction candidate selection (currently picks the first eligible batch job)
+- Eviction only considers victims in the same namespace and frees room with a single eviction; preempting several small jobs together, or ranking victims by priority/age, is not implemented
 - Storage polling: markers are polled every 3 seconds because object stores have no watch. Event notifications (e.g. MinIO bucket notifications) would remove the polling.
 - Credentials are passed to worker pods as plain environment variables; use a Secret (or IRSA / workload identity on AWS) outside of a demo.
 
 ### Design notes
+
+- **Admission reads the API server, not the cache.** Admission and the "does the worker Job already exist" check use the manager's API reader, so a job submitted a moment ago is always visible and cannot be over-committed because of informer lag. The cost is a few extra LIST calls per READY job per poll. As a second line of defence the worker pods carry real resource requests, so the Kubernetes scheduler would leave an over-admitted pod `Pending` rather than overload a node.
+- **Submission is safe to retry.** The marker is cleared only when the worker Job is actually created. If a previous attempt created the Job but failed to record `SUBMITTED`, the retry adopts that Job and leaves the marker alone (the worker may already have finished).
+- **Least privilege.** The controller only reads `PipelineJob`s (state changes go through the `status` subresource), creates/deletes `Job`s, and reads nodes and pods; it runs as a non-root user with a read-only root filesystem.
 
 - **No finalizer.** Deleting a `PipelineJob` needs no external cleanup: the underlying Job has an `OwnerReference` and is garbage-collected, and the controller drops the job from its in-memory DAG when it sees the deletion. A finalizer would only add a way for jobs to get stuck in `Terminating`.
 - **In-memory DAG.** The DAG registry and admission mutex live in the controller process. That is safe with leader election (one active replica; the DAG is rebuilt from the `PipelineJob`s as they reconcile after a failover).
