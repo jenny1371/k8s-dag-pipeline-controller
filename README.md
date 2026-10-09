@@ -21,9 +21,10 @@ This controller acts as a **dependency-aware gatekeeper** between the orchestrat
 
 - **DAG dependency resolution** — jobs wait until all upstream jobs are `DONE` before becoming `READY`
 - **Cycle detection** — the DAG registry rejects any job spec that would create a cycle
-- **Admission control** — checks live node allocatable capacity minus in-flight job requests before submitting
-- **Priority eviction** — `realtime` jobs can preempt `batch` jobs when cluster capacity is exhausted
-- **Storage-marker completion** — jobs are marked `DONE` only when an S3/MinIO `_SUCCESS` marker is detected
+- **Admission control** — checks real, per-node free capacity (allocatable minus the requests of all running pods, including non-PipelineJob workloads) before submitting; the worker pods carry matching `resources.requests`, so the Kubernetes scheduler enforces the same numbers
+- **Priority eviction** — `realtime` jobs can preempt `batch` jobs when cluster capacity is exhausted; batch jobs leave room for waiting realtime jobs so freed capacity is not taken back
+- **Storage-marker completion** — jobs are marked `DONE` only when an S3/MinIO `_SUCCESS` marker is detected; stale markers are cleared before every run, and storage errors surface as errors instead of looking like "not finished"
+- **Failure handling** — a failing worker, a timeout, an invalid spec or a failed upstream moves the job to a retry or to `FAILED` with a `status.reason`
 - **Timeout & retry** — configurable per-job timeout with a retry budget before permanent failure
 
 ---
@@ -57,7 +58,9 @@ KILLING ──► WAITING  (eviction recovery)
 - `SUBMITTED` — the underlying Kubernetes Job has been created.
 - `RUNNING` — the underlying Job has an active pod. The timeout still counts from submission.
 - `DONE` — the storage marker exists (checked in both `SUBMITTED` and `RUNNING`).
-- `TIMED_OUT` / `FAILED` — on timeout the Job is deleted; the job is retried (`TIMED_OUT` → `WAITING`) until `RetryBudget` is used up, then becomes `FAILED`. A job that would create a dependency cycle is set to `FAILED` immediately.
+- `TIMED_OUT` / `FAILED` — if the timeout expires or the worker exits with an error, the Job is deleted and the job is retried (`TIMED_OUT` → `WAITING`) until `RetryBudget` is used up, then becomes `FAILED`. `status.reason` says why.
+- Jobs that can never run fail immediately (no retry): an invalid spec (bad quantities, `storageMarker` not of the form `s3://<bucket>/<key>`), a dependency cycle, or an upstream that is `FAILED` (failures propagate down the DAG instead of leaving downstream jobs in `WAITING` forever).
+- Before each submission the controller deletes the job's marker, so a `_SUCCESS` left over from an earlier run (re-applied pipeline, retry) cannot mark the new run `DONE`. The worker only writes the marker after every step has succeeded.
 - `KILLING` — an evicted batch job. Its Kubernetes Job is deleted, and it returns to `WAITING` once the Job and its pods are confirmed gone, or after `KillConfirmTimeout` (120s) at the latest.
 
 ---
@@ -76,6 +79,7 @@ KILLING ──► WAITING  (eviction recovery)
 │   ├── eviction.go     # EvictionManager (preemption, kill confirmation)
 │   ├── dag_test.go     # Unit tests: cycle detection, upstream resolution
 │   ├── eviction_test.go # Unit tests: KILLING -> WAITING, KillConfirmTimeout
+│   ├── admission_test.go, storage_test.go, reconciler_test.go
 │   └── storage.go      # StorageChecker (S3/MinIO marker polling)
 ├── config/
 │   ├── job-image/
@@ -219,13 +223,20 @@ Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests t
 | `MaxEvictionCount` | 3 | Max times a batch job can be evicted |
 | `KillConfirmTimeout` | 120s | Max time an evicted job waits in `KILLING` for its Job/pods to disappear before re-queuing to `WAITING` |
 
-### Environment variables (storage)
+### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `MINIO_ENDPOINT` | `http://localhost:9000` | S3/MinIO endpoint used to poll `_SUCCESS` markers |
-| `MINIO_ACCESS_KEY` | `minioadmin` | Access key |
-| `MINIO_SECRET_KEY` | `minioadmin` | Secret key |
+| `MINIO_ENDPOINT` | `http://localhost:9000` | S3/MinIO endpoint the controller uses to poll `_SUCCESS` markers |
+| `MINIO_ACCESS_KEY` | `minioadmin` | Access key (also passed to workers) |
+| `MINIO_SECRET_KEY` | `minioadmin` | Secret key (also passed to workers) |
+| `WORKER_MINIO_ENDPOINT` | `http://minio.minio:9000` | MinIO address as seen from worker pods (differs from `MINIO_ENDPOINT` when the controller runs outside the cluster) |
+| `WORKER_IMAGE` | `pipeline-job:latest` | Worker container image |
+| `WORKER_IMAGE_PULL_POLICY` | `IfNotPresent` | Pull policy for the worker image |
+| `LEADER_ELECT` | `false` | Enable leader election so multiple controller replicas can run (the deployment sets it to `true`) |
+| `LEADER_ELECT_NAMESPACE` | `default` | Namespace of the leader-election lease when running outside the cluster |
+
+The bucket comes from each job's `storageMarker`; nothing about the bucket is hard-coded.
 
 ### Tests
 
@@ -237,8 +248,15 @@ go test ./...
 
 ## Future Work
 
-- Extend resource accounting to cover non-PipelineJob workloads for real multi-tenant cluster support
+- Admission only looks at CPU/memory requests and node taints. Node selectors, affinity, tolerations, ephemeral storage and GPUs are not considered, so a job can still be admitted and then sit `Pending` in the scheduler.
 - Priority-based eviction candidate selection (currently picks the first eligible batch job)
+- Storage polling: markers are polled every 3 seconds because object stores have no watch. Event notifications (e.g. MinIO bucket notifications) would remove the polling.
+- Credentials are passed to worker pods as plain environment variables; use a Secret (or IRSA / workload identity on AWS) outside of a demo.
+
+### Design notes
+
+- **No finalizer.** Deleting a `PipelineJob` needs no external cleanup: the underlying Job has an `OwnerReference` and is garbage-collected, and the controller drops the job from its in-memory DAG when it sees the deletion. A finalizer would only add a way for jobs to get stuck in `Terminating`.
+- **In-memory DAG.** The DAG registry and admission mutex live in the controller process. That is safe with leader election (one active replica; the DAG is rebuilt from the `PipelineJob`s as they reconcile after a failover).
 
 ---
 
