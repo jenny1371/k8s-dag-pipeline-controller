@@ -46,12 +46,19 @@ PipelineJob CRD
 
 ```
 WAITING ──► READY ──► SUBMITTED ──► RUNNING ──► DONE
-   ▲                                    │
-   │                                    ├──► TIMED_OUT ──► WAITING (retry)
-   │                                    └──► FAILED
+   ▲                      │            │
+   │                      └────────────┤
+   │                                   ├──► TIMED_OUT ──► WAITING (retry)
+   │                                   └──► FAILED
    │
 KILLING ──► WAITING  (eviction recovery)
 ```
+
+- `SUBMITTED` — the underlying Kubernetes Job has been created.
+- `RUNNING` — the underlying Job has an active pod. The timeout still counts from submission.
+- `DONE` — the storage marker exists (checked in both `SUBMITTED` and `RUNNING`).
+- `TIMED_OUT` / `FAILED` — on timeout the Job is deleted; the job is retried (`TIMED_OUT` → `WAITING`) until `RetryBudget` is used up, then becomes `FAILED`. A job that would create a dependency cycle is set to `FAILED` immediately.
+- `KILLING` — an evicted batch job. Its Kubernetes Job is deleted, and it returns to `WAITING` once the Job and its pods are confirmed gone, or after `KillConfirmTimeout` (120s) at the latest.
 
 ---
 
@@ -67,6 +74,7 @@ KILLING ──► WAITING  (eviction recovery)
 │   ├── dag.go          # DAGRegistry with DFS cycle detection
 │   ├── admission.go    # AdmissionChecker (CPU/memory capacity)
 │   ├── eviction.go     # EvictionManager (preemption, kill confirmation)
+│   ├── dag_test.go     # Unit tests: cycle detection, upstream resolution
 │   └── storage.go      # StorageChecker (S3/MinIO marker polling)
 ├── config/
 │   ├── job-image/
@@ -79,6 +87,7 @@ KILLING ──► WAITING  (eviction recovery)
 │   ├── test-eviction.yaml       # Eviction scenario
 │   └── test-eviction-bench.yaml
 ├── main.go
+├── go.mod
 └── go.sum
 ```
 
@@ -175,7 +184,7 @@ kubectl get pipelinejobs -w
 
 ### Eviction (`test-eviction.yaml`)
 
-Two `batch` jobs saturate cluster CPU. A `realtime` job waits for capacity; after `EvictionThreshold` (5s), the controller evicts a batch job to free resources, which re-queues after `KillConfirmTimeout`.
+Two `batch` jobs saturate cluster CPU. A `realtime` job waits for capacity; after `EvictionThreshold` (5s), the controller evicts a batch job to free resources. The evicted job sits in `KILLING` until its Kubernetes Job and pods are gone (or `KillConfirmTimeout` expires), then re-queues to `WAITING`.
 
 ---
 
@@ -183,12 +192,25 @@ Two `batch` jobs saturate cluster CPU. A `realtime` job waits for capacity; afte
 
 | Constant | Default | Description |
 |---|---|---|
-| `GracePeriod` | 60s | Reconcile grace period |
 | `DefaultTimeout` | 300s | Job timeout if not specified in spec |
 | `RetryBudget` | 2 | Max retries before permanent `FAILED` |
 | `EvictionThreshold` | 5s | How long a realtime job waits before triggering eviction |
 | `MaxEvictionCount` | 3 | Max times a batch job can be evicted |
-| `KillConfirmTimeout` | 120s | Grace period before evicted job re-queues to `WAITING` |
+| `KillConfirmTimeout` | 120s | Max time an evicted job waits in `KILLING` for its Job/pods to disappear before re-queuing to `WAITING` |
+
+### Environment variables (storage)
+
+| Variable | Default | Description |
+|---|---|---|
+| `MINIO_ENDPOINT` | `http://localhost:9000` | S3/MinIO endpoint used to poll `_SUCCESS` markers |
+| `MINIO_ACCESS_KEY` | `minioadmin` | Access key |
+| `MINIO_SECRET_KEY` | `minioadmin` | Secret key |
+
+### Tests
+
+```bash
+go test ./...
+```
 
 ---
 
