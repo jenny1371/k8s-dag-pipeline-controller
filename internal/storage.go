@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,11 +16,27 @@ type StorageChecker struct {
 	s3Client *s3.Client
 }
 
+// getEnv returns the value of the environment variable key, or fallback if unset/empty.
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// NewStorageChecker builds an S3 client for MinIO/S3. It reads:
+//   MINIO_ENDPOINT    (default "http://localhost:9000")
+//   MINIO_ACCESS_KEY  (default "minioadmin")
+//   MINIO_SECRET_KEY  (default "minioadmin")
 func NewStorageChecker(ctx context.Context) (*StorageChecker, error) {
+	endpoint := getEnv("MINIO_ENDPOINT", "http://localhost:9000")
+	accessKey := getEnv("MINIO_ACCESS_KEY", "minioadmin")
+	secretKey := getEnv("MINIO_SECRET_KEY", "minioadmin")
+
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion("us-east-1"),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			"minioadmin", "minioadmin", "",
+			accessKey, secretKey, "",
 		)),
 	)
 	if err != nil {
@@ -27,7 +44,7 @@ func NewStorageChecker(ctx context.Context) (*StorageChecker, error) {
 	}
 
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String("http://localhost:9000")
+		o.BaseEndpoint = aws.String(endpoint)
 		o.UsePathStyle = true
 	})
 
