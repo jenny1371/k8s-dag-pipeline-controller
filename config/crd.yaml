@@ -53,5 +53,7 @@ spec:
                   type: boolean
                 lastUpdated:
                   type: string
+                reason:
+                  type: string
       subresources:
         status: {}

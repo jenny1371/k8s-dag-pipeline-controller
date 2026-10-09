@@ -58,6 +58,8 @@ type PipelineJobStatus struct {
     RetryCount    int      `json:"retryCount,omitempty"`
     Preemptible   bool     `json:"preemptible,omitempty"`
     LastUpdated   string   `json:"lastUpdated,omitempty"`
+    // Reason explains why the job is FAILED or TIMED_OUT (invalid spec, cycle, failed upstream, ...).
+    Reason string `json:"reason,omitempty"`
 }
 
 // Internal controller logic

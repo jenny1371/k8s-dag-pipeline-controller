@@ -34,6 +34,14 @@ func (e *EvictionManager) FindEvictionCandidate(ctx context.Context) (*pipelinev
 		return nil, err
 	}
 
+	// An eviction is still in progress: the freed resources are not visible yet
+	// (the pod is still terminating), so evicting more would over-evict.
+	for i := range jobList.Items {
+		if jobList.Items[i].Status.State == pipelinev1.StateKilling {
+			return nil, nil
+		}
+	}
+
 	var candidate *pipelinev1.PipelineJob
 	for i := range jobList.Items {
 		job := &jobList.Items[i]

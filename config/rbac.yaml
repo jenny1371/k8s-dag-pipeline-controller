@@ -17,6 +17,10 @@ rules:
   - apiGroups: ["pipeline.io"]
     resources: ["pipelinejobs/status"]
     verbs: ["get", "update", "patch"]
+  # Needed to set ownerReferences with blockOwnerDeletion on the underlying Jobs
+  - apiGroups: ["pipeline.io"]
+    resources: ["pipelinejobs/finalizers"]
+    verbs: ["update"]
 
   # Node Resources（admission ）
   - apiGroups: [""]
@@ -36,6 +40,11 @@ rules:
   # SparkApplication
   - apiGroups: ["sparkoperator.k8s.io"]
     resources: ["sparkapplications"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # Events（controller-runtime ）

@@ -21,6 +21,15 @@ func init() {
     pipelinev1.AddToScheme(scheme)
 }
 
+// leaderElectionNamespace is only needed when running outside the cluster;
+// in-cluster controller-runtime detects the pod namespace itself.
+func leaderElectionNamespace() string {
+	if ns := os.Getenv("LEADER_ELECT_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return "default"
+}
+
 func main() {
     ctrl.SetLogger(zap.New())
 
@@ -29,6 +38,10 @@ func main() {
 		Metrics: metricsserver.Options{
 			BindAddress: "0",
 		},
+		// Enable with LEADER_ELECT=true to run more than one replica; only the leader reconciles.
+		LeaderElection:          os.Getenv("LEADER_ELECT") == "true",
+		LeaderElectionID:        "dag-pipeline-controller.pipeline.io",
+		LeaderElectionNamespace: leaderElectionNamespace(),
 	})
     if err != nil {
         ctrl.Log.Error(err, "manager 啟動失敗")
@@ -49,6 +62,7 @@ func main() {
         Admission: internal.NewAdmissionChecker(mgr.GetClient()),
         Eviction:  internal.NewEvictionManager(mgr.GetClient()),
         Storage:   storage,
+        Worker:    internal.NewWorkerConfigFromEnv(),
     }).SetupWithManager(mgr); err != nil {
         ctrl.Log.Error(err, "Reconciler 註冊失敗")
         os.Exit(1)

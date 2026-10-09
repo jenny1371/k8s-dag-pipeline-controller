@@ -6,6 +6,7 @@ RUN pip install pandas numpy --no-cache-dir
 COPY --from=bitnamilegacy/minio-client:latest /opt/bitnami/minio-client/bin/mc /usr/local/bin/mc
 
 COPY run.sh /run.sh
-RUN chmod +x /run.sh
+# Strip CR in case the script was checked out with Windows line endings
+RUN sed -i 's/\r$//' /run.sh && chmod +x /run.sh
 
 ENTRYPOINT ["/run.sh"]

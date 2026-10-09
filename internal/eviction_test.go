@@ -97,6 +97,29 @@ func TestHandleKilling(t *testing.T) {
 	}
 }
 
+func TestFindEvictionCandidate_NoSecondEvictionWhileOneIsInProgress(t *testing.T) {
+	running := &pipelinev1.PipelineJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "default"},
+		Spec:       pipelinev1.PipelineJobSpec{Priority: pipelinev1.PriorityBatch},
+		Status:     pipelinev1.PipelineJobStatus{State: pipelinev1.StateRunning},
+	}
+	killing := &pipelinev1.PipelineJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "killing", Namespace: "default"},
+		Spec:       pipelinev1.PipelineJobSpec{Priority: pipelinev1.PriorityBatch},
+		Status:     pipelinev1.PipelineJobStatus{State: pipelinev1.StateKilling},
+	}
+
+	got, err := NewEvictionManager(newClient(t, running)).FindEvictionCandidate(context.Background())
+	if err != nil || got == nil || got.Name != "running" {
+		t.Fatalf("with no eviction in progress: got (%v, %v), want the running batch job", got, err)
+	}
+
+	got, err = NewEvictionManager(newClient(t, running, killing)).FindEvictionCandidate(context.Background())
+	if err != nil || got != nil {
+		t.Errorf("with a job already KILLING: got (%v, %v), want no candidate", got, err)
+	}
+}
+
 func TestConfirmKilled_JobStillExists(t *testing.T) {
 	r, c := newKillingFixture(t, time.Second, false)
 	if err := c.Create(context.Background(), &batchv1.Job{
