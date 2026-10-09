@@ -164,3 +164,73 @@ func mustAdd(t *testing.T, d *DAGRegistry, name string, deps []string) {
 		t.Fatalf("Add(%q, %v) returned unexpected error: %v", name, deps, err)
 	}
 }
+
+func TestAdd_IsIdempotent(t *testing.T) {
+	d := NewDAGRegistry()
+	mustAdd(t, d, "a", nil)
+	mustAdd(t, d, "b", []string{"a"})
+
+	// The reconciler re-adds a waiting job on every poll; this must not
+	// duplicate edges or change the graph.
+	for i := 0; i < 5; i++ {
+		mustAdd(t, d, "b", []string{"a"})
+	}
+	if got := d.Downstream("a"); len(got) != 1 || got[0] != "b" {
+		t.Errorf("Downstream(a) = %v, want [b]", got)
+	}
+	if len(d.List()) != 2 {
+		t.Errorf("List() = %v, want 2 jobs", d.List())
+	}
+}
+
+func TestAdd_DownstreamIsIndependentOfRegistrationOrder(t *testing.T) {
+	d := NewDAGRegistry()
+	// Child registered before its parent.
+	mustAdd(t, d, "child", []string{"parent"})
+	mustAdd(t, d, "parent", nil)
+
+	if got := d.Downstream("parent"); len(got) != 1 || got[0] != "child" {
+		t.Errorf("Downstream(parent) = %v, want [child]", got)
+	}
+}
+
+func TestAdd_ChangedDependenciesReplaceOldEdges(t *testing.T) {
+	d := NewDAGRegistry()
+	mustAdd(t, d, "a", nil)
+	mustAdd(t, d, "b", nil)
+	mustAdd(t, d, "c", []string{"a"})
+	mustAdd(t, d, "c", []string{"b"})
+
+	if got := d.Downstream("a"); len(got) != 0 {
+		t.Errorf("Downstream(a) = %v, want empty after c moved to b", got)
+	}
+	if got := d.Downstream("b"); len(got) != 1 || got[0] != "c" {
+		t.Errorf("Downstream(b) = %v, want [c]", got)
+	}
+}
+
+func TestAdd_RejectedUpdateKeepsPreviousDefinition(t *testing.T) {
+	d := NewDAGRegistry()
+	mustAdd(t, d, "a", nil)
+	mustAdd(t, d, "b", []string{"a"})
+
+	// Changing a to depend on b would close a cycle; b must stay downstream of a.
+	if err := d.Add("a", []string{"b"}); err == nil {
+		t.Fatal("want cycle error")
+	}
+	if !d.AllUpstreamDone("a", map[string]bool{}) {
+		t.Error("a lost its original (empty) dependency list after the rejected update")
+	}
+	if got := d.Downstream("a"); len(got) != 1 || got[0] != "b" {
+		t.Errorf("Downstream(a) = %v, want [b]", got)
+	}
+}
+
+func TestAdd_DuplicateDependenciesAreCollapsed(t *testing.T) {
+	d := NewDAGRegistry()
+	mustAdd(t, d, "a", nil)
+	mustAdd(t, d, "b", []string{"a", "a"})
+	if got := d.Downstream("a"); len(got) != 1 {
+		t.Errorf("Downstream(a) = %v, want a single entry", got)
+	}
+}
