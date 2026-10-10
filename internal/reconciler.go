@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -15,8 +16,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -35,7 +40,15 @@ type WorkerConfig struct {
 	MinioEndpoint string
 	AccessKey     string
 	SecretKey     string
+	// TerminationGracePeriodSeconds is how long a worker pod gets between SIGTERM and
+	// SIGKILL. The worker script runs as PID 1 and does not react to SIGTERM, so the
+	// full period is always spent; keeping it short is what makes an evicted job's
+	// capacity come back quickly. Zero leaves the Kubernetes default (30s).
+	TerminationGracePeriodSeconds int64
 }
+
+// DefaultWorkerTerminationGrace is the worker pod's SIGTERM-to-SIGKILL window in seconds.
+const DefaultWorkerTerminationGrace = 5
 
 // NewWorkerConfigFromEnv reads:
 //
@@ -43,13 +56,23 @@ type WorkerConfig struct {
 //	WORKER_IMAGE_PULL_POLICY  (default "IfNotPresent")
 //	WORKER_MINIO_ENDPOINT     (default "http://minio.minio:9000")
 //	MINIO_ACCESS_KEY / MINIO_SECRET_KEY (default "minioadmin")
+//	WORKER_TERMINATION_GRACE_SECONDS (default 5)
 func NewWorkerConfigFromEnv() WorkerConfig {
+	grace := int64(DefaultWorkerTerminationGrace)
+	if v := getEnv("WORKER_TERMINATION_GRACE_SECONDS", ""); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			grace = n
+		} else {
+			ctrl.Log.Info("ignoring invalid WORKER_TERMINATION_GRACE_SECONDS", "value", v)
+		}
+	}
 	return WorkerConfig{
-		Image:           getEnv("WORKER_IMAGE", "pipeline-job:latest"),
-		ImagePullPolicy: corev1.PullPolicy(getEnv("WORKER_IMAGE_PULL_POLICY", string(corev1.PullIfNotPresent))),
-		MinioEndpoint:   getEnv("WORKER_MINIO_ENDPOINT", "http://minio.minio:9000"),
-		AccessKey:       getEnv("MINIO_ACCESS_KEY", "minioadmin"),
-		SecretKey:       getEnv("MINIO_SECRET_KEY", "minioadmin"),
+		TerminationGracePeriodSeconds: grace,
+		Image:                         getEnv("WORKER_IMAGE", "pipeline-job:latest"),
+		ImagePullPolicy:               corev1.PullPolicy(getEnv("WORKER_IMAGE_PULL_POLICY", string(corev1.PullIfNotPresent))),
+		MinioEndpoint:                 getEnv("WORKER_MINIO_ENDPOINT", "http://minio.minio:9000"),
+		AccessKey:                     getEnv("MINIO_ACCESS_KEY", "minioadmin"),
+		SecretKey:                     getEnv("MINIO_SECRET_KEY", "minioadmin"),
 	}
 }
 
@@ -524,6 +547,10 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 
 	w := r.Worker
 	backoffLimit := int32(0)
+	var grace *int64
+	if w.TerminationGracePeriodSeconds > 0 {
+		grace = &w.TerminationGracePeriodSeconds
+	}
 	underlyingJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "job-" + job.Name,
@@ -533,7 +560,8 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 			BackoffLimit: &backoffLimit,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					RestartPolicy:                 corev1.RestartPolicyNever,
+					TerminationGracePeriodSeconds: grace,
 					Containers: []corev1.Container{
 						{
 							Name:            "worker",
@@ -573,10 +601,52 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 	return r.Create(ctx, underlyingJob)
 }
 
+// upstreamFinished reports whether a PipelineJob update moved it into DONE or
+// FAILED, the two states that unblock (or fail) the jobs depending on it.
+func upstreamFinished(oldJob, newJob *pipelinev1.PipelineJob) bool {
+	if oldJob.Status.State == newJob.Status.State {
+		return false
+	}
+	return newJob.Status.State == pipelinev1.StateDone || newJob.Status.State == pipelinev1.StateFailed
+}
+
+// dependentsOf maps a finished PipelineJob to the jobs in its namespace that list
+// it as a dependency, so they are reconciled immediately instead of on the next poll.
+func (r *PipelineJobReconciler) dependentsOf(ctx context.Context, obj client.Object) []reconcile.Request {
+	list := &pipelinev1.PipelineJobList{}
+	if err := r.List(ctx, list, client.InNamespace(obj.GetNamespace())); err != nil {
+		ctrl.Log.Error(err, "failed to list dependents", "job", obj.GetName())
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range list.Items {
+		j := &list.Items[i]
+		for _, dep := range j.Spec.Dependencies {
+			if dep == obj.GetName() {
+				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(j)})
+				break
+			}
+		}
+	}
+	return reqs
+}
+
 func (r *PipelineJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pipelinev1.PipelineJob{}).
 		// Re-reconcile when an owned Job changes (pod started, job failed) instead of waiting for the poll.
 		Owns(&batchv1.Job{}).
+		// Wake downstream jobs as soon as an upstream finishes; the 3s requeue stays as a fallback.
+		Watches(&pipelinev1.PipelineJob{}, handler.EnqueueRequestsFromMapFunc(r.dependentsOf),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc:  func(event.CreateEvent) bool { return false },
+				DeleteFunc:  func(event.DeleteEvent) bool { return false },
+				GenericFunc: func(event.GenericEvent) bool { return false },
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					o, ok1 := e.ObjectOld.(*pipelinev1.PipelineJob)
+					n, ok2 := e.ObjectNew.(*pipelinev1.PipelineJob)
+					return ok1 && ok2 && upstreamFinished(o, n)
+				},
+			})).
 		Complete(r)
 }

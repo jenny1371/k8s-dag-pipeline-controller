@@ -235,6 +235,7 @@ Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests t
 | `WORKER_MINIO_ENDPOINT` | `http://minio.minio:9000` | MinIO address as seen from worker pods (differs from `MINIO_ENDPOINT` when the controller runs outside the cluster) |
 | `WORKER_IMAGE` | `pipeline-job:latest` | Worker container image |
 | `WORKER_IMAGE_PULL_POLICY` | `IfNotPresent` | Pull policy for the worker image |
+| `WORKER_TERMINATION_GRACE_SECONDS` | `5` | `terminationGracePeriodSeconds` of worker pods. The worker script runs as PID 1 and ignores SIGTERM, so an evicted pod always lingers for the full period; the Kubernetes default of 30s made eviction take ~31s to free capacity |
 | `LEADER_ELECT` | `false` | Enable leader election so multiple controller replicas can run (the deployment sets it to `true`) |
 | `LEADER_ELECT_NAMESPACE` | `default` | Namespace of the leader-election lease when running outside the cluster |
 

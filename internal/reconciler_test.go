@@ -393,3 +393,66 @@ func TestReconcile_DeletedJobIsRemovedFromDAG(t *testing.T) {
 func reqFor(name string) reconcile.Request {
 	return reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: "default"}}
 }
+
+func TestUnderlyingJob_UsesShortTerminationGrace(t *testing.T) {
+	r, c, _ := newTestReconciler(t, node("n1", "4", "8Gi"), pj("stage-1", pipelinev1.StateReady))
+	r.Worker.TerminationGracePeriodSeconds = 5
+	if _, err := r.handleReady(context.Background(), get(t, c, "stage-1")); err != nil {
+		t.Fatal(err)
+	}
+	underlying := &batchv1.Job{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "job-stage-1", Namespace: "default"}, underlying); err != nil {
+		t.Fatal(err)
+	}
+	g := underlying.Spec.Template.Spec.TerminationGracePeriodSeconds
+	if g == nil || *g != 5 {
+		t.Errorf("terminationGracePeriodSeconds = %v, want 5 (an evicted pod must free its node quickly)", g)
+	}
+}
+
+func TestNewWorkerConfigFromEnv_TerminationGrace(t *testing.T) {
+	if got := NewWorkerConfigFromEnv().TerminationGracePeriodSeconds; got != DefaultWorkerTerminationGrace {
+		t.Errorf("default grace = %d, want %d", got, DefaultWorkerTerminationGrace)
+	}
+	t.Setenv("WORKER_TERMINATION_GRACE_SECONDS", "12")
+	if got := NewWorkerConfigFromEnv().TerminationGracePeriodSeconds; got != 12 {
+		t.Errorf("grace = %d, want 12", got)
+	}
+	t.Setenv("WORKER_TERMINATION_GRACE_SECONDS", "abc")
+	if got := NewWorkerConfigFromEnv().TerminationGracePeriodSeconds; got != DefaultWorkerTerminationGrace {
+		t.Errorf("invalid value should fall back to default, got %d", got)
+	}
+}
+
+func TestUpstreamFinished(t *testing.T) {
+	cases := []struct {
+		from, to pipelinev1.JobState
+		want     bool
+	}{
+		{pipelinev1.StateRunning, pipelinev1.StateDone, true},
+		{pipelinev1.StateRunning, pipelinev1.StateFailed, true},
+		{pipelinev1.StateWaiting, pipelinev1.StateReady, false},
+		{pipelinev1.StateDone, pipelinev1.StateDone, false},
+	}
+	for _, tc := range cases {
+		if got := upstreamFinished(pj("a", tc.from), pj("a", tc.to)); got != tc.want {
+			t.Errorf("%s -> %s: got %v, want %v", tc.from, tc.to, got, tc.want)
+		}
+	}
+}
+
+func TestDependentsOf_ReturnsOnlyDirectDependents(t *testing.T) {
+	up := pj("up", pipelinev1.StateDone)
+	d1 := pj("d1", pipelinev1.StateWaiting, "up")
+	d2 := pj("d2", pipelinev1.StateWaiting, "other", "up")
+	unrelated := pj("x", pipelinev1.StateWaiting, "other")
+	r, _, _ := newTestReconciler(t, up, d1, d2, unrelated)
+
+	got := map[string]bool{}
+	for _, q := range r.dependentsOf(context.Background(), up) {
+		got[q.Name] = true
+	}
+	if len(got) != 2 || !got["d1"] || !got["d2"] {
+		t.Errorf("dependents = %v, want d1 and d2 only", got)
+	}
+}
