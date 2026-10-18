@@ -3,6 +3,8 @@ package internal
 import (
 	"context"
 	"sort"
+	"sync"
+	"time"
 
 	pipelinev1 "pipeline-controller/api/v1"
 
@@ -15,12 +17,31 @@ import (
 // client.Reader rather than the cached client: pass the manager's API reader so
 // that a job submitted a moment ago is already visible and admission cannot
 // over-commit on stale cache data.
+//
+// Listing every node, pod and PipelineJob for every READY job on every poll
+// would cost O(jobs x cluster size). Admission is serialized anyway, so the
+// snapshot is reused for SnapshotTTL; callers invalidate it whenever they change
+// the cluster themselves (submit or evict), which is what makes their own
+// decisions visible immediately.
 type AdmissionChecker struct {
 	reader client.Reader
+	// SnapshotTTL is how long a snapshot may be reused. Zero disables caching.
+	SnapshotTTL time.Duration
+
+	mu       sync.Mutex
+	cached   *snapshot
+	cachedAt time.Time
 }
 
 func NewAdmissionChecker(r client.Reader) *AdmissionChecker {
-	return &AdmissionChecker{reader: r}
+	return &AdmissionChecker{reader: r, SnapshotTTL: time.Second}
+}
+
+// Invalidate drops the cached snapshot so the next decision re-reads the cluster.
+func (a *AdmissionChecker) Invalidate() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cached = nil
 }
 
 // resources is a CPU (millicores) and memory (bytes) amount.
@@ -47,6 +68,13 @@ type snapshot struct {
 }
 
 func (a *AdmissionChecker) snapshot(ctx context.Context) (*snapshot, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.cached != nil && a.SnapshotTTL > 0 && time.Since(a.cachedAt) < a.SnapshotTTL {
+		return a.cached, nil
+	}
+
 	nodeList := &corev1.NodeList{}
 	if err := a.reader.List(ctx, nodeList); err != nil {
 		return nil, err
@@ -59,7 +87,10 @@ func (a *AdmissionChecker) snapshot(ctx context.Context) (*snapshot, error) {
 	if err := a.reader.List(ctx, jobList); err != nil {
 		return nil, err
 	}
-	return &snapshot{nodes: nodeList.Items, pods: podList.Items, jobs: jobList.Items}, nil
+
+	a.cached = &snapshot{nodes: nodeList.Items, pods: podList.Items, jobs: jobList.Items}
+	a.cachedAt = time.Now()
+	return a.cached, nil
 }
 
 // HasCapacity reports whether a single node can still fit the job's request.

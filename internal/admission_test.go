@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"testing"
+	"time"
 
 	pipelinev1 "pipeline-controller/api/v1"
 
@@ -55,6 +56,9 @@ func newClient(t *testing.T, objs ...client.Object) client.Client {
 		WithScheme(scheme).
 		WithObjects(objs...).
 		WithStatusSubresource(&pipelinev1.PipelineJob{}).
+		WithIndex(&pipelinev1.PipelineJob{}, markerIndexField, func(o client.Object) []string {
+			return []string{o.(*pipelinev1.PipelineJob).Spec.StorageMarker}
+		}).
 		Build()
 }
 
@@ -214,5 +218,51 @@ func TestHasCapacity_UnschedulableRealtimeDoesNotStarveBatch(t *testing.T) {
 	batch := readyJob("hog", pipelinev1.PriorityBatch, "3", "1Gi")
 	if ok, err := a.HasCapacity(context.Background(), batch); err != nil || !ok {
 		t.Errorf("batch: got (%v, %v), want (true, nil)", ok, err)
+	}
+}
+
+func TestSnapshotIsReusedUntilInvalidated(t *testing.T) {
+	c := newClient(t, node("n1", "4", "8Gi"))
+	a := NewAdmissionChecker(c)
+	a.SnapshotTTL = time.Hour
+	job := readyJob("j", pipelinev1.PriorityBatch, "3", "1Gi")
+	ctx := context.Background()
+
+	if ok, err := a.HasCapacity(ctx, job); err != nil || !ok {
+		t.Fatalf("empty node: got (%v, %v), want (true, nil)", ok, err)
+	}
+
+	// Another workload now takes the node. Within the TTL the cached snapshot is
+	// reused (one LIST round instead of one per job per poll)...
+	if err := c.Create(ctx, pod("hog", "n1", "3", "1Gi", corev1.PodRunning)); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := a.HasCapacity(ctx, job); !ok {
+		t.Error("expected the cached snapshot to be reused within the TTL")
+	}
+
+	// ...and the controller invalidates it after its own submit/evict, so its own
+	// decisions are never made on stale data.
+	a.Invalidate()
+	if ok, _ := a.HasCapacity(ctx, job); ok {
+		t.Error("after Invalidate the new pod must be visible and the job must not fit")
+	}
+}
+
+func TestSnapshotTTLZeroDisablesCaching(t *testing.T) {
+	c := newClient(t, node("n1", "4", "8Gi"))
+	a := NewAdmissionChecker(c)
+	a.SnapshotTTL = 0
+	job := readyJob("j", pipelinev1.PriorityBatch, "3", "1Gi")
+	ctx := context.Background()
+
+	if ok, _ := a.HasCapacity(ctx, job); !ok {
+		t.Fatal("want fit on empty node")
+	}
+	if err := c.Create(ctx, pod("hog", "n1", "3", "1Gi", corev1.PodRunning)); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := a.HasCapacity(ctx, job); ok {
+		t.Error("with caching disabled the new pod must be seen immediately")
 	}
 }
