@@ -215,6 +215,25 @@ Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests t
 
 ---
 
+## Performance
+
+Measured on a single-node kind cluster (8 CPUs, Docker Desktop on a laptop), comparing the controller before and after the faster-release changes. Each scenario was run 3 times; the table shows the median (and the slowest run). Times come from the controller's own `job_event` log lines.
+
+| What | Before | After |
+|---|---|---|
+| Evicted job's pod gone, capacity usable again (`EVICTED` → `KILL_CONFIRMED`) | 30.8 s (max 35.7 s) | 6.8 s |
+| Realtime job that needs an eviction: created → worker running (`READY` → `RUNNING`) | 41.8 s | 13.1 s |
+| Upstream `DONE` → downstream `SUBMITTED` (6-job chain, 15 hand-offs) | 3.0 s (max 3.0 s, mean 1.9 s) | 0.03 s (max 0.14 s) |
+
+Why it was slow, and what changed:
+
+- **Eviction took ~31 s.** The worker script runs as PID 1 and ignores SIGTERM, so every evicted pod waited out the full Kubernetes default `terminationGracePeriodSeconds` of 30 s before its CPU came back. Worker pods now get a 5 s grace period (`WORKER_TERMINATION_GRACE_SECONDS`), and a `KILLING` job re-checks for its old pod every 2 s instead of 5 s.
+- **Downstream jobs waited up to 3 s** after an upstream finished, because they only polled. The controller now also watches `PipelineJob` transitions to `DONE`/`FAILED` and wakes the direct dependents immediately (looked up in the in-memory DAG, no LIST). The 3 s requeue stays as a fallback.
+
+Caveats: small samples (3 runs per scenario; in one "after" run the victim's confirmation was not logged before cleanup, so that row has 2 samples); one machine, one node; the eviction scenario is `small` (200m) + two large batch jobs + one realtime job as in `config/test-eviction.yaml`. Handing a slot to a queued job when the cluster is full still relies on the 3 s poll, and a shorter grace period only suits workers that need no clean-up time on SIGTERM (raise it if yours do).
+
+---
+
 ## Configuration Constants
 
 | Constant | Default | Description |
