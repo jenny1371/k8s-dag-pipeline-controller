@@ -3,6 +3,8 @@ package internal
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,8 +17,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -30,6 +36,11 @@ const (
 	// cluster do not eat into the job's own time budget.
 	StartTimeout = 10 * time.Minute
 	RetryBudget  = 2
+
+	// killPollInterval is how often a KILLING job re-checks whether its old pod is gone.
+	// Pod deletion does not wake the reconciler, so this poll is what hands the freed
+	// capacity back; keep it short.
+	killPollInterval = 2 * time.Second
 
 	// markerIndexField indexes PipelineJobs by spec.storageMarker so duplicate
 	// markers can be found without scanning every job.
@@ -46,7 +57,15 @@ type WorkerConfig struct {
 	MinioEndpoint string
 	AccessKey     string
 	SecretKey     string
+	// TerminationGracePeriodSeconds is how long a worker pod gets between SIGTERM and
+	// SIGKILL. The worker script runs as PID 1 and does not react to SIGTERM, so the
+	// full period is always spent; keeping it short is what makes an evicted job's
+	// capacity come back quickly. Zero leaves the Kubernetes default (30s).
+	TerminationGracePeriodSeconds int64
 }
+
+// DefaultWorkerTerminationGrace is the worker pod's SIGTERM-to-SIGKILL window in seconds.
+const DefaultWorkerTerminationGrace = 5
 
 // NewWorkerConfigFromEnv reads:
 //
@@ -54,13 +73,23 @@ type WorkerConfig struct {
 //	WORKER_IMAGE_PULL_POLICY  (default "IfNotPresent")
 //	WORKER_MINIO_ENDPOINT     (default "http://minio.minio:9000")
 //	MINIO_ACCESS_KEY / MINIO_SECRET_KEY (default "minioadmin")
+//	WORKER_TERMINATION_GRACE_SECONDS (default 5)
 func NewWorkerConfigFromEnv() WorkerConfig {
+	grace := int64(DefaultWorkerTerminationGrace)
+	if v := getEnv("WORKER_TERMINATION_GRACE_SECONDS", ""); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			grace = n
+		} else {
+			ctrl.Log.Info("ignoring invalid WORKER_TERMINATION_GRACE_SECONDS", "value", v)
+		}
+	}
 	return WorkerConfig{
-		Image:           getEnv("WORKER_IMAGE", "pipeline-job:latest"),
-		ImagePullPolicy: corev1.PullPolicy(getEnv("WORKER_IMAGE_PULL_POLICY", string(corev1.PullIfNotPresent))),
-		MinioEndpoint:   getEnv("WORKER_MINIO_ENDPOINT", "http://minio.minio:9000"),
-		AccessKey:       getEnv("MINIO_ACCESS_KEY", "minioadmin"),
-		SecretKey:       getEnv("MINIO_SECRET_KEY", "minioadmin"),
+		TerminationGracePeriodSeconds: grace,
+		Image:                         getEnv("WORKER_IMAGE", "pipeline-job:latest"),
+		ImagePullPolicy:               corev1.PullPolicy(getEnv("WORKER_IMAGE_PULL_POLICY", string(corev1.PullIfNotPresent))),
+		MinioEndpoint:                 getEnv("WORKER_MINIO_ENDPOINT", "http://minio.minio:9000"),
+		AccessKey:                     getEnv("MINIO_ACCESS_KEY", "minioadmin"),
+		SecretKey:                     getEnv("MINIO_SECRET_KEY", "minioadmin"),
 	}
 }
 
@@ -495,7 +524,7 @@ func (r *PipelineJobReconciler) handleKilling(ctx context.Context, job *pipeline
 		if err := r.Status().Update(ctx, job); err != nil {
 			return reconcile.Result{}, err
 		}
-		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: killPollInterval}, nil
 	}
 
 	// The old pod is still terminating. The job stays in KILLING until it is gone,
@@ -511,7 +540,7 @@ func (r *PipelineJobReconciler) handleKilling(ctx context.Context, job *pipeline
 		}
 	}
 
-	return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+	return reconcile.Result{RequeueAfter: killPollInterval}, nil
 }
 
 func (r *PipelineJobReconciler) handleTimedOut(ctx context.Context, job *pipelinev1.PipelineJob) (reconcile.Result, error) {
@@ -646,6 +675,10 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 
 	w := r.Worker
 	backoffLimit := int32(0)
+	var grace *int64
+	if w.TerminationGracePeriodSeconds > 0 {
+		grace = &w.TerminationGracePeriodSeconds
+	}
 	underlyingJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "job-" + job.Name,
@@ -655,7 +688,8 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 			BackoffLimit: &backoffLimit,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					RestartPolicy:                 corev1.RestartPolicyNever,
+					TerminationGracePeriodSeconds: grace,
 					Containers: []corev1.Container{
 						{
 							Name:            "worker",
@@ -695,6 +729,32 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 	return r.Create(ctx, underlyingJob)
 }
 
+// upstreamFinished reports whether a PipelineJob update moved it into DONE or
+// FAILED, the two states that unblock (or fail) the jobs depending on it.
+func upstreamFinished(oldJob, newJob *pipelinev1.PipelineJob) bool {
+	if oldJob.Status.State == newJob.Status.State {
+		return false
+	}
+	return newJob.Status.State == pipelinev1.StateDone || newJob.Status.State == pipelinev1.StateFailed
+}
+
+// dependentsOf maps a finished PipelineJob to the jobs that list it as a
+// dependency, so they are reconciled immediately instead of on the next poll.
+// It asks the DAG registry (an in-memory lookup) instead of listing every
+// PipelineJob in the namespace on each completion. A dependent the registry does
+// not know yet is picked up by the 3s fallback requeue.
+func (r *PipelineJobReconciler) dependentsOf(_ context.Context, obj client.Object) []reconcile.Request {
+	var reqs []reconcile.Request
+	for _, key := range r.DAG.Downstream(jobKey(obj.GetNamespace(), obj.GetName())) {
+		namespace, name, ok := strings.Cut(key, "/")
+		if !ok {
+			continue
+		}
+		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}})
+	}
+	return reqs
+}
+
 func (r *PipelineJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Index jobs by storage marker so duplicate markers are found without a scan.
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &pipelinev1.PipelineJob{}, markerIndexField,
@@ -708,5 +768,17 @@ func (r *PipelineJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&pipelinev1.PipelineJob{}).
 		// Re-reconcile when an owned Job changes (pod started, job failed) instead of waiting for the poll.
 		Owns(&batchv1.Job{}).
+		// Wake downstream jobs as soon as an upstream finishes; the 3s requeue stays as a fallback.
+		Watches(&pipelinev1.PipelineJob{}, handler.EnqueueRequestsFromMapFunc(r.dependentsOf),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc:  func(event.CreateEvent) bool { return false },
+				DeleteFunc:  func(event.DeleteEvent) bool { return false },
+				GenericFunc: func(event.GenericEvent) bool { return false },
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					o, ok1 := e.ObjectOld.(*pipelinev1.PipelineJob)
+					n, ok2 := e.ObjectNew.(*pipelinev1.PipelineJob)
+					return ok1 && ok2 && upstreamFinished(o, n)
+				},
+			})).
 		Complete(r)
 }

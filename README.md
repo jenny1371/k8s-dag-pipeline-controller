@@ -24,7 +24,7 @@ This controller acts as a **dependency-aware gatekeeper** between the orchestrat
 - **Admission control** — checks real, per-node free capacity (allocatable minus the requests of all running pods, including non-PipelineJob workloads) before submitting; the worker pods carry matching `resources.requests`, so the Kubernetes scheduler enforces the same numbers
 - **Priority eviction** — a `realtime` job that cannot fit waits `EvictionThreshold`, then preempts a `batch` job in its namespace, but only one whose removal actually lets it fit on a single node (the smallest such job is chosen; if no single eviction would help, nothing is killed). Batch jobs leave room for waiting realtime jobs so the freed capacity is not taken back, and no second eviction starts while one is in progress
 - **Storage-marker completion** — jobs are marked `DONE` only when an S3/MinIO `_SUCCESS` marker is detected; stale markers are cleared before every run, and storage errors surface as errors instead of looking like "not finished"
-- **Visible state** — `kubectl get pipelinejobs` shows STATE, PRIORITY, RETRIES and EVICTIONS (`-o wide` adds REASON); a job that is waiting says what for, e.g. `waiting: upstream job "stge-1" not found`. A new job starts in `WAITING`, not blank
+- **Visible state** — `kubectl get pipelinejobs` shows STATE, PRIORITY, RETRIES and EVICTIONS (`-o wide` adds REASON); a job that is waiting says what for, e.g. `waiting: upstream job "no-such-job" not found`. A new job starts in `WAITING`, not blank
 - **Validation at the API** — the CRD requires `priority`, `requestCPU`, `requestMemory` and `storageMarker` and checks their format, so invalid specs are rejected by `kubectl apply` instead of failing later in the controller
 - **Failure handling** — a failing worker, a timeout, an invalid spec or a failed upstream moves the job to a retry or to `FAILED` with a `status.reason`
 - **Timeout & retry** — configurable per-job timeout with a retry budget before permanent failure
@@ -236,6 +236,7 @@ Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests t
 | `WORKER_MINIO_ENDPOINT` | `http://minio.minio:9000` | MinIO address as seen from worker pods (differs from `MINIO_ENDPOINT` when the controller runs outside the cluster) |
 | `WORKER_IMAGE` | `pipeline-job:latest` | Worker container image |
 | `WORKER_IMAGE_PULL_POLICY` | `IfNotPresent` | Pull policy for the worker image |
+| `WORKER_TERMINATION_GRACE_SECONDS` | `5` | `terminationGracePeriodSeconds` of worker pods. The worker script runs as PID 1 and ignores SIGTERM, so an evicted pod always lingers for the full period; the Kubernetes default of 30s made eviction take ~31s to free capacity |
 | `LEADER_ELECT` | `false` | Enable leader election so multiple controller replicas can run (the deployment sets it to `true`) |
 | `LEADER_ELECT_NAMESPACE` | `default` | Namespace of the leader-election lease when running outside the cluster |
 
