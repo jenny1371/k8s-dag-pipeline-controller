@@ -158,16 +158,27 @@ kind load docker-image dag-pipeline-controller:latest
 
 > On Windows, `.gitattributes` keeps `run.sh` on LF line endings; without that the worker fails with `exec /run.sh: no such file or directory`.
 
-### 3. Deploy MinIO and create the bucket
+### 3. Create the credentials Secret, deploy MinIO and create the bucket
+
+Storage credentials live in a Secret named `minio-credentials` and are read through `secretKeyRef` by MinIO, the controller and the worker pods, so no pod spec contains them. There is no built-in default password.
 
 ```bash
+# Demo credentials for a local kind cluster. For anything else, create the Secret yourself
+# (see the header of config/minio-secret.yaml) instead of applying this file.
+kubectl apply -f config/minio-secret.yaml
+
 kubectl apply -f config/minio.yaml
 kubectl -n minio rollout status deploy/minio
 
-kubectl run mkbucket --rm -i --restart=Never   --image=pipeline-job:latest --image-pull-policy=Never --command --   sh -c 'mc alias set s http://minio.minio:9000 minioadmin minioadmin && mc mb --ignore-existing s/test-bucket'
+kubectl apply -f config/create-bucket-job.yaml
+kubectl wait --for=condition=complete job/create-bucket --timeout=120s
 ```
 
+A Secret is namespaced: it must exist in `minio` (for MinIO) and in every namespace where `PipelineJob`s run (the controller and the worker pods read it there). `config/minio-secret.yaml` creates it in `minio` and `default`.
+
 > `minio/minio` is no longer published on Docker Hub, so `config/minio.yaml` uses the frozen `bitnamilegacy/minio` image, and the worker image copies `mc` from `bitnamilegacy/minio-client`. Load the MinIO image into kind too if it cannot pull from Docker Hub.
+
+**On AWS** do not use static keys. Run the controller with an IRSA role: leave `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` unset and it uses the AWS default credential chain. The example worker talks to storage through `mc` with static keys, so a worker on AWS should use the AWS SDK/CLI with its own IRSA role; set `WORKER_CREDENTIALS_SECRET=""` to stop injecting keys.
 
 ### 4. Run the controller
 
@@ -182,6 +193,8 @@ Or locally, against a port-forwarded MinIO (default endpoint `http://localhost:9
 
 ```bash
 kubectl -n minio port-forward svc/minio 9000:9000 &
+export MINIO_ACCESS_KEY=$(kubectl get secret minio-credentials -o jsonpath='{.data.accessKey}' | base64 -d)
+export MINIO_SECRET_KEY=$(kubectl get secret minio-credentials -o jsonpath='{.data.secretKey}' | base64 -d)
 go run main.go
 ```
 
@@ -250,8 +263,8 @@ Caveats: small samples (3 runs per scenario; in one "after" run the victim's con
 | Variable | Default | Description |
 |---|---|---|
 | `MINIO_ENDPOINT` | `http://localhost:9000` | S3/MinIO endpoint the controller uses to poll `_SUCCESS` markers |
-| `MINIO_ACCESS_KEY` | `minioadmin` | Access key (also passed to workers) |
-| `MINIO_SECRET_KEY` | `minioadmin` | Secret key (also passed to workers) |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | *(none)* | Static storage credentials for the controller; set both or neither. In the cluster they come from the `minio-credentials` Secret. When both are unset the AWS default credential chain (IRSA, instance role, ...) is used |
+| `WORKER_CREDENTIALS_SECRET` | `minio-credentials` | Name of the Secret (keys `accessKey`, `secretKey`) that worker pods read their credentials from via `secretKeyRef`; empty injects no credentials |
 | `WORKER_MINIO_ENDPOINT` | `http://minio.minio:9000` | MinIO address as seen from worker pods (differs from `MINIO_ENDPOINT` when the controller runs outside the cluster) |
 | `WORKER_IMAGE` | `pipeline-job:latest` | Worker container image |
 | `WORKER_IMAGE_PULL_POLICY` | `IfNotPresent` | Pull policy for the worker image |
@@ -281,6 +294,7 @@ go test ./...
 - **Admission reads the API server, not the cache.** Admission and the "does the worker Job already exist" check use the manager's API reader, so a job is never admitted on stale cache data. To keep this from costing a full LIST of nodes, pods and PipelineJobs per READY job per poll (O(jobs x cluster size)), the admission snapshot is reused for one second and dropped as soon as the controller itself submits or evicts a job, so its own decisions are always made on fresh data. Other workloads can therefore be up to a second stale, which is fine: the worker pods carry real resource requests, so the Kubernetes scheduler would leave an over-admitted pod `Pending` rather than overload a node.
 - **Cheap reconciles.** A waiting job looks up only its own dependencies (a cached Get each) instead of listing every PipelineJob, and duplicate storage markers are found through a field index on `spec.storageMarker`, not a scan.
 - **Submission is safe to retry.** The marker is cleared only when the worker Job is actually created. If a previous attempt created the Job but failed to record `SUBMITTED`, the retry adopts that Job and leaves the marker alone (the worker may already have finished).
+- **Slots are handed over on events, not only by polling.** The controller watches worker pods: the moment one finishes (Succeeded/Failed) or is deleted, which is when its resources are really released, it drops the admission snapshot and wakes every READY job (cluster-wide, found through a field index on `status.state`), so the first job that fits is submitted at once. A `PipelineJob` turning `DONE` is deliberately not the trigger, because the marker can appear while the pod is still running. A pod that has finished no longer counts against its job in admission, even before the controller has recorded `DONE`. The 3 s poll stays as a fallback.
 - **Least privilege.** The controller only reads `PipelineJob`s (state changes go through the `status` subresource), creates/deletes `Job`s, and reads nodes and pods; it runs as a non-root user with a read-only root filesystem.
 
 - **No finalizer.** Deleting a `PipelineJob` needs no external cleanup: the underlying Job has an `OwnerReference` and is garbage-collected, and the controller drops the job from its in-memory DAG when it sees the deletion. A finalizer would only add a way for jobs to get stuck in `Terminating`.
