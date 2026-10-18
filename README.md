@@ -58,12 +58,12 @@ KILLING ──► WAITING  (eviction recovery)
 ```
 
 - `SUBMITTED` — the underlying Kubernetes Job has been created.
-- `RUNNING` — the underlying Job has an active pod. The timeout still counts from submission.
+- `RUNNING` — the worker container is actually running (not merely created or `Pending`). The run timeout (`timeoutSeconds`) is measured from this moment, so scheduling delays and image pulls do not count against it. A pod that never starts within `StartTimeout` (10 min) is retried like a timeout.
 - `DONE` — the storage marker exists (checked in both `SUBMITTED` and `RUNNING`).
 - `TIMED_OUT` / `FAILED` — if the timeout expires or the worker exits with an error, the Job is deleted and the job is retried (`TIMED_OUT` → `WAITING`) until `RetryBudget` is used up, then becomes `FAILED`. `status.reason` says why.
-- Jobs that can never run fail immediately (no retry): an invalid spec (bad quantities, `storageMarker` not of the form `s3://<bucket>/<key>`), a dependency cycle, or an upstream that is `FAILED` (failures propagate down the DAG instead of leaving downstream jobs in `WAITING` forever).
+- Jobs that can never run fail immediately (no retry): an invalid spec (bad quantities, `storageMarker` not of the form `s3://<bucket>/<key>`), a dependency cycle, a `storageMarker` already used by another job (the older job keeps it; each job needs its own marker), or an upstream that is `FAILED` (failures propagate down the DAG instead of leaving downstream jobs in `WAITING` forever).
 - Before each submission the controller deletes the job's marker, so a `_SUCCESS` left over from an earlier run (re-applied pipeline, retry) cannot mark the new run `DONE`. The worker only writes the marker after every step has succeeded.
-- `KILLING` — an evicted batch job. Its Kubernetes Job is deleted, and it returns to `WAITING` once the Job and its pods are confirmed gone, or after `KillConfirmTimeout` (120s) at the latest.
+- `KILLING` — an evicted batch job. Its Kubernetes Job is deleted and it returns to `WAITING` only once the Job and all its pods are gone, so a new pod never runs next to the old one. If that takes longer than `KillConfirmTimeout` (120s) the job stays in `KILLING` and `status.reason` says the old pod is still terminating (look at the node); it is never forced back while the old pod could still be running. Its resources stay accounted for in the meantime.
 
 ---
 
@@ -80,8 +80,8 @@ KILLING ──► WAITING  (eviction recovery)
 │   ├── admission.go    # AdmissionChecker (CPU/memory capacity)
 │   ├── eviction.go     # EvictionManager (preemption, kill confirmation)
 │   ├── dag_test.go     # Unit tests: cycle detection, upstream resolution
-│   ├── eviction_test.go # Unit tests: KILLING -> WAITING, KillConfirmTimeout
-│   ├── admission_test.go, storage_test.go, reconciler_test.go, victim_test.go
+│   ├── eviction_test.go # Unit tests: KILLING -> WAITING, victim selection
+│   ├── admission_test.go, storage_test.go, reconciler_test.go, victim_test.go, crd_test.go
 │   └── storage.go      # StorageChecker (S3/MinIO marker polling)
 ├── config/
 │   ├── job-image/
@@ -211,7 +211,7 @@ kubectl get pipelinejobs -w
 
 ### Eviction (`test-eviction.yaml`)
 
-Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests to your cluster). A `realtime` job waits for capacity; after `EvictionThreshold` (5s), the controller evicts a batch job to free resources. The evicted job sits in `KILLING` until its Kubernetes Job and pods are gone (or `KillConfirmTimeout` expires), then re-queues to `WAITING`. While the realtime job is waiting, batch jobs leave room for it, so the freed capacity goes to the realtime job; no second eviction starts while one is still in progress.
+Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests to your cluster). A `realtime` job waits for capacity; after `EvictionThreshold` (5s), the controller evicts a batch job to free resources. The evicted job sits in `KILLING` until its Kubernetes Job and pods are gone, then re-queues to `WAITING`. While the realtime job is waiting, batch jobs leave room for it, so the freed capacity goes to the realtime job; no second eviction starts while one is still in progress.
 
 ---
 
@@ -219,11 +219,12 @@ Two `batch` jobs take 6 of 8 CPUs (sized for an 8-CPU node; scale the requests t
 
 | Constant | Default | Description |
 |---|---|---|
-| `DefaultTimeout` | 300s | Job timeout if not specified in spec |
+| `DefaultTimeout` | 300s | Run timeout if not specified in the spec; counted from the moment the worker is running |
+| `StartTimeout` | 10m | Max time between submission and the worker pod running (scheduling + image pull) |
 | `RetryBudget` | 2 | Max retries before permanent `FAILED` |
 | `EvictionThreshold` | 5s | How long a realtime job waits before triggering eviction |
 | `MaxEvictionCount` | 3 | Max times a batch job can be evicted |
-| `KillConfirmTimeout` | 120s | Max time an evicted job waits in `KILLING` for its Job/pods to disappear before re-queuing to `WAITING` |
+| `KillConfirmTimeout` | 120s | After this long in `KILLING`, `status.reason` reports that the old pod is still terminating; the job keeps waiting for it to disappear |
 
 ### Environment variables
 
@@ -257,7 +258,8 @@ go test ./...
 
 ### Design notes
 
-- **Admission reads the API server, not the cache.** Admission and the "does the worker Job already exist" check use the manager's API reader, so a job submitted a moment ago is always visible and cannot be over-committed because of informer lag. The cost is a few extra LIST calls per READY job per poll. As a second line of defence the worker pods carry real resource requests, so the Kubernetes scheduler would leave an over-admitted pod `Pending` rather than overload a node.
+- **Admission reads the API server, not the cache.** Admission and the "does the worker Job already exist" check use the manager's API reader, so a job is never admitted on stale cache data. To keep this from costing a full LIST of nodes, pods and PipelineJobs per READY job per poll (O(jobs x cluster size)), the admission snapshot is reused for one second and dropped as soon as the controller itself submits or evicts a job, so its own decisions are always made on fresh data. Other workloads can therefore be up to a second stale, which is fine: the worker pods carry real resource requests, so the Kubernetes scheduler would leave an over-admitted pod `Pending` rather than overload a node.
+- **Cheap reconciles.** A waiting job looks up only its own dependencies (a cached Get each) instead of listing every PipelineJob, and duplicate storage markers are found through a field index on `spec.storageMarker`, not a scan.
 - **Submission is safe to retry.** The marker is cleared only when the worker Job is actually created. If a previous attempt created the Job but failed to record `SUBMITTED`, the retry adopts that Job and leaves the marker alone (the worker may already have finished).
 - **Least privilege.** The controller only reads `PipelineJob`s (state changes go through the `status` subresource), creates/deletes `Job`s, and reads nodes and pods; it runs as a non-root user with a read-only root filesystem.
 
