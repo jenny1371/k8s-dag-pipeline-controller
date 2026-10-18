@@ -55,7 +55,8 @@ spec:
                   pattern: '^[0-9]+(\.[0-9]+)?m?$'
                 requestMemory:
                   type: string
-                  pattern: '^[0-9]+(\.[0-9]+)?([EPTGMK]i?)?$'
+                  # Kubernetes quantity suffixes: Ki Mi Gi Ti Pi Ei (binary) and k M G T P E (decimal; lowercase k only)
+                  pattern: '^[0-9]+(\.[0-9]+)?([KMGTPE]i|[kMGTPE])?$'
                 storageMarker:
                   type: string
                   pattern: '^s3://[^/]+/.+'
