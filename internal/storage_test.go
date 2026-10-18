@@ -24,6 +24,8 @@ func newFakeS3(t *testing.T) (*fakeS3, *StorageChecker) {
 	t.Cleanup(srv.Close)
 
 	t.Setenv("MINIO_ENDPOINT", srv.URL)
+	t.Setenv("MINIO_ACCESS_KEY", "test-access-key")
+	t.Setenv("MINIO_SECRET_KEY", "test-secret-key")
 	sc, err := NewStorageChecker(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -121,5 +123,28 @@ func TestParseS3Path(t *testing.T) {
 		if (err != nil) != tt.wantErr || b != tt.bucket || k != tt.key {
 			t.Errorf("parseS3Path(%q) = (%q, %q, %v), want (%q, %q, err=%v)", tt.in, b, k, err, tt.bucket, tt.key, tt.wantErr)
 		}
+	}
+}
+
+func TestNewStorageChecker_CredentialRules(t *testing.T) {
+	ctx := context.Background()
+
+	t.Setenv("MINIO_ACCESS_KEY", "only-one")
+	t.Setenv("MINIO_SECRET_KEY", "")
+	if _, err := NewStorageChecker(ctx); err == nil {
+		t.Error("only one of the two keys set: want an error")
+	}
+
+	t.Setenv("MINIO_ACCESS_KEY", "")
+	t.Setenv("MINIO_SECRET_KEY", "only-one")
+	if _, err := NewStorageChecker(ctx); err == nil {
+		t.Error("only one of the two keys set: want an error")
+	}
+
+	// Neither key: the AWS default credential chain (IRSA etc.) is used, no built-in default.
+	t.Setenv("MINIO_ACCESS_KEY", "")
+	t.Setenv("MINIO_SECRET_KEY", "")
+	if _, err := NewStorageChecker(ctx); err != nil {
+		t.Errorf("no static keys: want the default credential chain, got %v", err)
 	}
 }

@@ -10,8 +10,8 @@ set -eu
 : "${MARKER_PATH:?MARKER_PATH is required}"
 
 MINIO_ENDPOINT="${MINIO_ENDPOINT:-http://minio.minio:9000}"
-MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-minioadmin}"
-MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
+: "${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required (injected from a Secret)}"
+: "${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required (injected from a Secret)}"
 DURATION="${DURATION:-30}"
 
 echo "Job $JOB_NAME starting, stage $STAGE"
@@ -79,5 +79,7 @@ esac
 
 echo "Writing marker to MinIO"
 echo "done" | mc pipe "store/$MARKER_PATH" --insecure
+# Timestamp used by bench/ to measure how fast a freed slot is handed to the next job.
+echo "worker_exit_ms=$(python3 -c 'import time; print(int(time.time() * 1000))')"
 
 echo "Job $JOB_NAME complete"

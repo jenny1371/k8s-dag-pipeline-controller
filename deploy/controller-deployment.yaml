@@ -28,6 +28,20 @@ spec:
         env:
         - name: MINIO_ENDPOINT
           value: http://minio.minio:9000
+        # Storage credentials come from a Secret (see config/minio-secret.yaml); there is no built-in default.
+        - name: MINIO_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: accessKey
+        - name: MINIO_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: secretKey
+        # Worker pods read the same keys from this Secret (it must exist in each job's namespace)
+        - name: WORKER_CREDENTIALS_SECRET
+          value: minio-credentials
         # Address worker pods use to reach MinIO (may differ from the controller's when it runs outside the cluster)
         - name: WORKER_MINIO_ENDPOINT
           value: http://minio.minio:9000

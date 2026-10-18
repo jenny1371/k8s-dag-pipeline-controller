@@ -30,19 +30,25 @@ func getEnv(key, fallback string) string {
 // NewStorageChecker builds an S3 client for MinIO/S3. It reads:
 //
 //	MINIO_ENDPOINT    (default "http://localhost:9000")
-//	MINIO_ACCESS_KEY  (default "minioadmin")
-//	MINIO_SECRET_KEY  (default "minioadmin")
+//	MINIO_ACCESS_KEY  \ static credentials; both or neither. There is no built-in
+//	MINIO_SECRET_KEY  / default: in a cluster they come from a Secret.
+//
+// When neither key is set the AWS default credential chain is used (environment,
+// shared config, IRSA / web identity, instance role), which is what you want on AWS.
 func NewStorageChecker(ctx context.Context) (*StorageChecker, error) {
 	endpoint := getEnv("MINIO_ENDPOINT", "http://localhost:9000")
-	accessKey := getEnv("MINIO_ACCESS_KEY", "minioadmin")
-	secretKey := getEnv("MINIO_SECRET_KEY", "minioadmin")
+	accessKey := os.Getenv("MINIO_ACCESS_KEY")
+	secretKey := os.Getenv("MINIO_SECRET_KEY")
 
-	cfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion("us-east-1"),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			accessKey, secretKey, "",
-		)),
-	)
+	opts := []func(*config.LoadOptions) error{config.WithRegion("us-east-1")}
+	switch {
+	case accessKey != "" && secretKey != "":
+		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")))
+	case accessKey != "" || secretKey != "":
+		return nil, fmt.Errorf("MINIO_ACCESS_KEY and MINIO_SECRET_KEY must be set together (or both left unset to use the AWS default credential chain)")
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
