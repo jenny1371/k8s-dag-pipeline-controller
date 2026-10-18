@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,7 +76,7 @@ func TestHandleKilling(t *testing.T) {
 		{"job and pods already gone: confirmed immediately", 2 * time.Second, false, pipelinev1.StateWaiting},
 		{"pod still terminating, inside the window: keep waiting", 30 * time.Second, true, pipelinev1.StateKilling},
 		{"pod still terminating, just inside the timeout", KillConfirmTimeout - 5*time.Second, true, pipelinev1.StateKilling},
-		{"pod never goes away: forced to WAITING after KillConfirmTimeout", KillConfirmTimeout + 5*time.Second, true, pipelinev1.StateWaiting},
+		{"pod never goes away: still KILLING after KillConfirmTimeout (no overlap with a new pod)", KillConfirmTimeout + 5*time.Second, true, pipelinev1.StateKilling},
 	}
 
 	for _, tt := range tests {
@@ -94,6 +95,24 @@ func TestHandleKilling(t *testing.T) {
 				t.Errorf("state = %s, want %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestHandleKilling_SlowKillSaysWhy(t *testing.T) {
+	r, c := newKillingFixture(t, KillConfirmTimeout+5*time.Second, true)
+	job := &pipelinev1.PipelineJob{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "victim", Namespace: "default"}, job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.handleKilling(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	got := &pipelinev1.PipelineJob{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "victim", Namespace: "default"}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.State != pipelinev1.StateKilling || !strings.Contains(got.Status.Reason, "still terminating") {
+		t.Errorf("state=%s reason=%q, want KILLING with an explanation", got.Status.State, got.Status.Reason)
 	}
 }
 

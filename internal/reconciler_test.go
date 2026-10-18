@@ -42,7 +42,7 @@ func newTestReconciler(t *testing.T, objs ...client.Object) (*PipelineJobReconci
 	return &PipelineJobReconciler{
 		Client:    c,
 		DAG:       NewDAGRegistry(),
-		Admission: NewAdmissionChecker(c),
+		Admission: noCacheAdmission(c),
 		Eviction:  NewEvictionManager(c),
 		Storage:   storage,
 		Worker: WorkerConfig{
@@ -301,18 +301,147 @@ func TestHandleRunning_MarkerMeansDone(t *testing.T) {
 	}
 }
 
-func TestHandleRunning_ActivePodMovesSubmittedToRunning(t *testing.T) {
-	underlying := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: "job-x", Namespace: "default"},
-		Status:     batchv1.JobStatus{Active: 1},
-	}
-	r, c, _ := newTestReconciler(t, pj("x", pipelinev1.StateSubmitted), underlying)
+func TestHandleRunning_RunningPodMovesSubmittedToRunning(t *testing.T) {
+	j := pj("x", pipelinev1.StateSubmitted)
+	j.Status.LastUpdated = ago(2 * time.Minute) // submitted a while ago (scheduling + image pull)
+	r, c, _ := newTestReconciler(t, j, workerPod("x", "n1", "200m", "256Mi"))
 
 	if _, err := r.handleRunning(context.Background(), get(t, c, "x")); err != nil {
 		t.Fatal(err)
 	}
+	got := get(t, c, "x")
+	if got.Status.State != pipelinev1.StateRunning {
+		t.Fatalf("state = %s, want RUNNING", got.Status.State)
+	}
+	// The run timeout restarts when the worker starts, not at submission.
+	if since(got.Status.LastUpdated) > 10*time.Second {
+		t.Errorf("LastUpdated is %s old, want it reset when the pod started running", since(got.Status.LastUpdated))
+	}
+}
+
+func TestHandleRunning_PendingPodStaysSubmittedAndDoesNotTimeOutEarly(t *testing.T) {
+	// The run timeout is 10s but the pod has been Pending for a minute (image
+	// pull / no room yet): that must not count as the job running too long.
+	j := pj("x", pipelinev1.StateSubmitted)
+	j.Spec.TimeoutSeconds = 10
+	j.Status.LastUpdated = ago(time.Minute)
+	pending := workerPod("x", "n1", "200m", "256Mi")
+	pending.Status.Phase = corev1.PodPending
+	r, c, _ := newTestReconciler(t, j, pending)
+
+	if _, err := r.handleRunning(context.Background(), get(t, c, "x")); err != nil {
+		t.Fatal(err)
+	}
+	if s := get(t, c, "x").Status.State; s != pipelinev1.StateSubmitted {
+		t.Errorf("state = %s, want SUBMITTED (pod is still Pending, run timeout has not started)", s)
+	}
+}
+
+func TestHandleRunning_PodThatNeverStartsIsRetried(t *testing.T) {
+	j := pj("x", pipelinev1.StateSubmitted)
+	j.Status.LastUpdated = ago(StartTimeout + time.Minute)
+	pending := workerPod("x", "", "200m", "256Mi")
+	pending.Status.Phase = corev1.PodPending
+	r, c, _ := newTestReconciler(t, j, pending)
+
+	if _, err := r.handleRunning(context.Background(), get(t, c, "x")); err != nil {
+		t.Fatal(err)
+	}
+	got := get(t, c, "x")
+	if got.Status.State != pipelinev1.StateTimedOut || !strings.Contains(got.Status.Reason, "did not start") {
+		t.Errorf("state=%s reason=%q, want TIMED_OUT because the pod never started", got.Status.State, got.Status.Reason)
+	}
+}
+
+func TestHandleRunning_RunTimeoutCountsFromRunning(t *testing.T) {
+	j := pj("x", pipelinev1.StateRunning)
+	j.Spec.TimeoutSeconds = 60
+	j.Status.LastUpdated = ago(30 * time.Second)
+	r, c, _ := newTestReconciler(t, j)
+	if _, err := r.handleRunning(context.Background(), get(t, c, "x")); err != nil {
+		t.Fatal(err)
+	}
 	if s := get(t, c, "x").Status.State; s != pipelinev1.StateRunning {
-		t.Errorf("state = %s, want RUNNING", s)
+		t.Errorf("state = %s, want RUNNING (30s of a 60s budget used)", s)
+	}
+}
+
+func TestHandleWaiting_DuplicateMarkerFailsTheNewerJob(t *testing.T) {
+	older := pj("first", pipelinev1.StateRunning)
+	older.Spec.StorageMarker = "s3://test-bucket/shared/_SUCCESS"
+	older.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+	newer := pj("second", pipelinev1.StateWaiting)
+	newer.Spec.StorageMarker = "s3://test-bucket/shared/_SUCCESS"
+	newer.CreationTimestamp = metav1.NewTime(time.Now())
+	r, c, _ := newTestReconciler(t, older, newer)
+	ctx := context.Background()
+
+	if _, err := r.handleWaiting(ctx, get(t, c, "second")); err != nil {
+		t.Fatal(err)
+	}
+	got := get(t, c, "second")
+	if got.Status.State != pipelinev1.StateFailed || !strings.Contains(got.Status.Reason, "first") {
+		t.Errorf("newer: state=%s reason=%q, want FAILED naming the job that owns the marker", got.Status.State, got.Status.Reason)
+	}
+
+	// The older job is not affected when it is reconciled.
+	waitingOlder := get(t, c, "first")
+	waitingOlder.Status.State = pipelinev1.StateWaiting
+	if err := c.Status().Update(ctx, waitingOlder); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.handleWaiting(ctx, get(t, c, "first")); err != nil {
+		t.Fatal(err)
+	}
+	if s := get(t, c, "first").Status.State; s == pipelinev1.StateFailed {
+		t.Error("the older job must keep its marker and must not fail")
+	}
+}
+
+func TestHandleWaiting_FailedJobDoesNotHoldItsMarker(t *testing.T) {
+	failed := pj("failed-one", pipelinev1.StateFailed)
+	failed.Spec.StorageMarker = "s3://test-bucket/shared/_SUCCESS"
+	failed.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+	next := pj("next", pipelinev1.StateWaiting)
+	next.Spec.StorageMarker = "s3://test-bucket/shared/_SUCCESS"
+	r, c, _ := newTestReconciler(t, failed, next)
+
+	if _, err := r.handleWaiting(context.Background(), get(t, c, "next")); err != nil {
+		t.Fatal(err)
+	}
+	if s := get(t, c, "next").Status.State; s != pipelinev1.StateReady {
+		t.Errorf("state = %s, want READY (a FAILED job never ran, so it holds no marker)", s)
+	}
+}
+
+func TestHandleWaiting_DistinctMarkersDoNotConflict(t *testing.T) {
+	r, c, _ := newTestReconciler(t, pj("a", pipelinev1.StateRunning), pj("b", pipelinev1.StateWaiting))
+	if _, err := r.handleWaiting(context.Background(), get(t, c, "b")); err != nil {
+		t.Fatal(err)
+	}
+	if s := get(t, c, "b").Status.State; s != pipelinev1.StateReady {
+		t.Errorf("state = %s, want READY", s)
+	}
+}
+
+func TestHandleReady_WaitsWhilePreviousWorkerPodIsStillTerminating(t *testing.T) {
+	r, c, s3 := newTestReconciler(t,
+		node("n1", "4", "8Gi"),
+		pj("x", pipelinev1.StateReady),
+		workerPod("x", "n1", "200m", "256Mi"), // pod of the previous attempt; its Job is already gone
+	)
+
+	if _, err := r.handleReady(context.Background(), get(t, c, "x")); err == nil {
+		t.Fatal("want an error (retry later) while the previous pod is still there")
+	}
+	if s := get(t, c, "x").Status.State; s != pipelinev1.StateReady {
+		t.Errorf("state = %s, want READY (nothing submitted)", s)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "job-x", Namespace: "default"}, &batchv1.Job{}); err == nil {
+		t.Error("a new Job was created next to the old pod")
+	}
+	if len(s3.deleted) != 0 {
+		t.Errorf("marker cleared while the old pod could still be running: %v", s3.deleted)
 	}
 }
 
@@ -392,4 +521,10 @@ func TestReconcile_DeletedJobIsRemovedFromDAG(t *testing.T) {
 
 func reqFor(name string) reconcile.Request {
 	return reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: "default"}}
+}
+
+func noCacheAdmission(c client.Client) *AdmissionChecker {
+	a := NewAdmissionChecker(c)
+	a.SnapshotTTL = 0
+	return a
 }

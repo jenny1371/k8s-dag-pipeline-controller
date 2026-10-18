@@ -21,8 +21,19 @@ import (
 )
 
 const (
+	// DefaultTimeout is how long a worker may run (measured from the moment its
+	// container is running, not from submission) when the spec sets no timeout.
 	DefaultTimeout = 300 * time.Second
-	RetryBudget    = 2
+	// StartTimeout bounds the time between submission and the worker pod running
+	// (scheduling plus image pull), so a pod stuck in Pending is retried instead of
+	// waiting forever. It is separate from the run timeout so slow starts on a busy
+	// cluster do not eat into the job's own time budget.
+	StartTimeout = 10 * time.Minute
+	RetryBudget  = 2
+
+	// markerIndexField indexes PipelineJobs by spec.storageMarker so duplicate
+	// markers can be found without scanning every job.
+	markerIndexField = "spec.storageMarker"
 )
 
 // WorkerConfig describes how the worker pods are built.
@@ -202,7 +213,18 @@ func (r *PipelineJobReconciler) handleWaiting(ctx context.Context, job *pipeline
 		return r.fail(ctx, job, err.Error())
 	}
 
-	states, err := r.listStates(ctx)
+	// Two jobs sharing a marker would clear each other's marker or mistake it for
+	// their own completion; the newer one fails.
+	other, err := r.markerConflict(ctx, job)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if other != nil {
+		return r.fail(ctx, job, fmt.Sprintf("storageMarker %q is already used by job %q; every job needs its own marker",
+			job.Spec.StorageMarker, jobKey(other.Namespace, other.Name)))
+	}
+
+	states, err := r.dependencyStates(ctx, job)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -264,6 +286,8 @@ func (r *PipelineJobReconciler) handleReady(ctx context.Context, job *pipelinev1
 			ctrl.Log.Error(err, "failed to create underlying job", "job", job.Name)
 			return reconcile.Result{}, err
 		}
+		// The next admission decision must see this job's claim.
+		r.Admission.Invalidate()
 		job.Status.State = pipelinev1.StateSubmitted
 		job.Status.Reason = ""
 		job.Status.LastUpdated = nowTime()
@@ -306,6 +330,7 @@ func (r *PipelineJobReconciler) evictFor(ctx context.Context, waiting *pipelinev
 	ctrl.Log.Info("evicting", "candidate", victim.Name, "for", waiting.Name)
 	ctrl.Log.Info("job_event", "job", victim.Name, "event", "EVICTED", "ts", time.Now().UnixMilli())
 	// Evict deletes the K8s Job and moves the victim to KILLING.
+	defer r.Admission.Invalidate()
 	return r.Eviction.Evict(ctx, victim)
 }
 
@@ -377,21 +402,11 @@ func (r *PipelineJobReconciler) handleRunning(ctx context.Context, job *pipeline
 		if underlyingJobFailed(underlying) {
 			return r.retryOrFail(ctx, job, "underlying job failed")
 		}
-		// SUBMITTED -> RUNNING once the underlying K8s Job has an active pod.
-		// LastUpdated is left untouched so the timeout still counts from submission.
-		if job.Status.State == pipelinev1.StateSubmitted && underlying.Status.Active > 0 {
-			job.Status.State = pipelinev1.StateRunning
-			ctrl.Log.Info("job_event", "job", job.Name, "event", "RUNNING", "ts", time.Now().UnixMilli())
-			if err := r.Status().Update(ctx, job); err != nil {
-				return reconcile.Result{RequeueAfter: time.Second}, err
-			}
-			return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
-		}
 	case !apierrors.IsNotFound(err):
 		return reconcile.Result{}, err
 	}
 
-	// Without a timestamp there is nothing to measure the timeout from; stamp it
+	// Without a timestamp there is nothing to measure a timeout from; stamp it
 	// now rather than treating the job as instantly overdue.
 	if job.Status.LastUpdated == nil {
 		job.Status.LastUpdated = nowTime()
@@ -401,16 +416,64 @@ func (r *PipelineJobReconciler) handleRunning(ctx context.Context, job *pipeline
 		return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
 	}
 
+	if job.Status.State == pipelinev1.StateSubmitted {
+		// SUBMITTED -> RUNNING once the worker container is actually running (not
+		// merely created or Pending). The run timeout restarts from this moment, so
+		// scheduling delays and image pulls do not count against it.
+		started, err := r.workerStarted(ctx, job)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if started {
+			job.Status.State = pipelinev1.StateRunning
+			job.Status.LastUpdated = nowTime()
+			ctrl.Log.Info("job_event", "job", job.Name, "event", "RUNNING", "ts", time.Now().UnixMilli())
+			if err := r.Status().Update(ctx, job); err != nil {
+				return reconcile.Result{RequeueAfter: time.Second}, err
+			}
+			return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		if since(job.Status.LastUpdated) > StartTimeout {
+			return r.retryOrFail(ctx, job, fmt.Sprintf("worker pod did not start within %s", StartTimeout))
+		}
+		return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
 	timeout := DefaultTimeout
 	if job.Spec.TimeoutSeconds > 0 {
 		timeout = time.Duration(job.Spec.TimeoutSeconds) * time.Second
 	}
-
 	if since(job.Status.LastUpdated) > timeout {
 		return r.retryOrFail(ctx, job, "timed out")
 	}
 
 	return reconcile.Result{RequeueAfter: 3 * time.Second}, nil
+}
+
+// workerPods lists the pods the Job controller created for this job's worker Job.
+func (r *PipelineJobReconciler) workerPods(ctx context.Context, reader client.Reader, job *pipelinev1.PipelineJob) ([]corev1.Pod, error) {
+	pods := &corev1.PodList{}
+	if err := reader.List(ctx, pods,
+		client.InNamespace(job.Namespace),
+		client.MatchingLabels{"job-name": "job-" + job.Name},
+	); err != nil {
+		return nil, err
+	}
+	return pods.Items, nil
+}
+
+// workerStarted reports whether a worker pod is running (or already finished).
+func (r *PipelineJobReconciler) workerStarted(ctx context.Context, job *pipelinev1.PipelineJob) (bool, error) {
+	pods, err := r.workerPods(ctx, r.Client, job)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range pods {
+		if p.Status.Phase == corev1.PodRunning || p.Status.Phase == corev1.PodSucceeded {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *PipelineJobReconciler) handleKilling(ctx context.Context, job *pipelinev1.PipelineJob) (reconcile.Result, error) {
@@ -419,20 +482,33 @@ func (r *PipelineJobReconciler) handleKilling(ctx context.Context, job *pipeline
 		ctrl.Log.Error(err, "delete underlying job in killing state failed", "job", job.Name)
 	}
 
-	// Re-queue once the kill is confirmed, or after KillConfirmTimeout at the latest.
 	confirmed, err := r.Eviction.ConfirmKilled(ctx, job)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	if confirmed || since(job.Status.LastUpdated) > KillConfirmTimeout {
+	if confirmed {
 		job.Status.State = pipelinev1.StateWaiting
+		job.Status.Reason = ""
 		job.Status.LastUpdated = nowTime()
-		ctrl.Log.Info("job_event", "job", job.Name, "event", "KILL_CONFIRMED", "confirmed", confirmed, "ts", time.Now().UnixMilli())
+		ctrl.Log.Info("job_event", "job", job.Name, "event", "KILL_CONFIRMED", "ts", time.Now().UnixMilli())
 		if err := r.Status().Update(ctx, job); err != nil {
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// The old pod is still terminating. The job stays in KILLING until it is gone,
+	// so a new pod can never overlap the old one (its resources stay accounted
+	// for meanwhile). After KillConfirmTimeout the job says why it is stuck, so an
+	// operator can look at the node.
+	reason := fmt.Sprintf("old worker pod still terminating after %s; waiting for it to disappear before re-queuing", KillConfirmTimeout)
+	if since(job.Status.LastUpdated) > KillConfirmTimeout && job.Status.Reason != reason {
+		job.Status.Reason = reason
+		ctrl.Log.Info("job_event", "job", job.Name, "event", "KILL_SLOW", "ts", time.Now().UnixMilli())
+		if err := r.Status().Update(ctx, job); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 
 	return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
@@ -448,18 +524,54 @@ func (r *PipelineJobReconciler) handleTimedOut(ctx context.Context, job *pipelin
 	return reconcile.Result{}, nil
 }
 
-// listStates returns the state of every PipelineJob, keyed by namespace/name.
-func (r *PipelineJobReconciler) listStates(ctx context.Context) (map[string]pipelinev1.JobState, error) {
-	jobList := &pipelinev1.PipelineJobList{}
-	if err := r.List(ctx, jobList); err != nil {
-		return nil, err
-	}
-
-	states := make(map[string]pipelinev1.JobState, len(jobList.Items))
-	for _, j := range jobList.Items {
-		states[jobKey(j.Namespace, j.Name)] = j.Status.State
+// dependencyStates returns the state of each of the job's dependencies that
+// exists, keyed by namespace/name. It looks up only the job's own dependencies
+// (a cached Get each), not every PipelineJob in the cluster.
+func (r *PipelineJobReconciler) dependencyStates(ctx context.Context, job *pipelinev1.PipelineJob) (map[string]pipelinev1.JobState, error) {
+	states := make(map[string]pipelinev1.JobState, len(job.Spec.Dependencies))
+	for _, dep := range job.Spec.Dependencies {
+		up := &pipelinev1.PipelineJob{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: dep}, up)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		states[jobKey(job.Namespace, dep)] = up.Status.State
 	}
 	return states, nil
+}
+
+// markerConflict returns another job that uses the same storageMarker and that
+// should keep it, or nil. FAILED jobs never ran, so they do not hold a marker.
+// The older job (by creation time, then name) wins.
+func (r *PipelineJobReconciler) markerConflict(ctx context.Context, job *pipelinev1.PipelineJob) (*pipelinev1.PipelineJob, error) {
+	list := &pipelinev1.PipelineJobList{}
+	if err := r.List(ctx, list, client.MatchingFields{markerIndexField: job.Spec.StorageMarker}); err != nil {
+		return nil, err
+	}
+	for i := range list.Items {
+		other := &list.Items[i]
+		if other.Namespace == job.Namespace && other.Name == job.Name {
+			continue
+		}
+		if other.Status.State == pipelinev1.StateFailed {
+			continue
+		}
+		if isNewer(job, other) {
+			return other, nil
+		}
+	}
+	return nil, nil
+}
+
+// isNewer reports whether a was created after b (ties broken by name so exactly one side loses).
+func isNewer(a, b *pipelinev1.PipelineJob) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return b.CreationTimestamp.Before(&a.CreationTimestamp)
+	}
+	return jobKey(a.Namespace, a.Name) > jobKey(b.Namespace, b.Name)
 }
 
 // ensureUnderlyingJob makes sure the worker Job for this run exists.
@@ -476,6 +588,16 @@ func (r *PipelineJobReconciler) ensureUnderlyingJob(ctx context.Context, job *pi
 		return r.checkExistingJob(ctx, job, existing)
 	case !apierrors.IsNotFound(err):
 		return err
+	}
+
+	// A deleted Job's pods can outlive it for a while. Never start the next
+	// attempt next to a pod of the previous one.
+	pods, err := r.workerPods(ctx, r.reader(), job)
+	if err != nil {
+		return err
+	}
+	if len(pods) > 0 {
+		return fmt.Errorf("previous worker pod %q is still terminating", pods[0].Name)
 	}
 
 	// No Job yet: drop any marker left by a previous run (re-applied pipeline,
@@ -574,6 +696,14 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 }
 
 func (r *PipelineJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Index jobs by storage marker so duplicate markers are found without a scan.
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &pipelinev1.PipelineJob{}, markerIndexField,
+		func(o client.Object) []string {
+			return []string{o.(*pipelinev1.PipelineJob).Spec.StorageMarker}
+		}); err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&pipelinev1.PipelineJob{}).
 		// Re-reconcile when an owned Job changes (pod started, job failed) instead of waiting for the poll.
