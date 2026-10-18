@@ -277,11 +277,16 @@ func pendingRequests(pods []corev1.Pod, jobs []pipelinev1.PipelineJob) []resourc
 
 	for i := range pods {
 		p := &pods[i]
-		if isTerminated(p) {
-			continue
-		}
+		// Any pod of the job, even a finished one, means the job's claim is
+		// represented by its real pod usage (zero once the pod has finished). Only a
+		// job with no pod at all still holds a virtual claim. This is what lets the
+		// capacity of a finished worker be reused immediately, before the controller
+		// has noticed the marker and moved the PipelineJob to DONE.
 		if name := p.Labels["job-name"]; name != "" {
 			havePod[p.Namespace+"/"+name] = true
+		}
+		if isTerminated(p) {
+			continue
 		}
 		if p.Spec.NodeName == "" {
 			out = append(out, podRequests(p))

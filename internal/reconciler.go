@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,9 @@ const (
 	// markerIndexField indexes PipelineJobs by spec.storageMarker so duplicate
 	// markers can be found without scanning every job.
 	markerIndexField = "spec.storageMarker"
+	// stateIndexField indexes PipelineJobs by status.state so the READY jobs can be
+	// found without scanning every job.
+	stateIndexField = "status.state"
 )
 
 // WorkerConfig describes how the worker pods are built.
@@ -55,8 +59,10 @@ type WorkerConfig struct {
 	// separate from the controller's own MINIO_ENDPOINT because the controller may
 	// run outside the cluster (localhost) while workers must use the in-cluster address.
 	MinioEndpoint string
-	AccessKey     string
-	SecretKey     string
+	// CredentialsSecret names a Secret (in the job's namespace) with the keys
+	// "accessKey" and "secretKey". The worker pod reads its credentials from it, so
+	// they never appear in the pod spec. Empty means no credentials are injected.
+	CredentialsSecret string
 	// TerminationGracePeriodSeconds is how long a worker pod gets between SIGTERM and
 	// SIGKILL. The worker script runs as PID 1 and does not react to SIGTERM, so the
 	// full period is always spent; keeping it short is what makes an evicted job's
@@ -67,12 +73,32 @@ type WorkerConfig struct {
 // DefaultWorkerTerminationGrace is the worker pod's SIGTERM-to-SIGKILL window in seconds.
 const DefaultWorkerTerminationGrace = 5
 
+// credentialsSecretFromEnv returns the Secret holding the worker's storage
+// credentials. An explicitly empty WORKER_CREDENTIALS_SECRET disables injection.
+func credentialsSecretFromEnv() string {
+	if v, ok := os.LookupEnv("WORKER_CREDENTIALS_SECRET"); ok {
+		return v
+	}
+	return "minio-credentials"
+}
+
+// secretEnv is an env var whose value comes from a Secret key, not from the pod spec.
+func secretEnv(name, secret, key string) corev1.EnvVar {
+	return corev1.EnvVar{
+		Name: name,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: secret},
+			Key:                  key,
+		}},
+	}
+}
+
 // NewWorkerConfigFromEnv reads:
 //
 //	WORKER_IMAGE              (default "pipeline-job:latest")
 //	WORKER_IMAGE_PULL_POLICY  (default "IfNotPresent")
 //	WORKER_MINIO_ENDPOINT     (default "http://minio.minio:9000")
-//	MINIO_ACCESS_KEY / MINIO_SECRET_KEY (default "minioadmin")
+//	WORKER_CREDENTIALS_SECRET (default "minio-credentials"; empty injects no credentials)
 //	WORKER_TERMINATION_GRACE_SECONDS (default 5)
 func NewWorkerConfigFromEnv() WorkerConfig {
 	grace := int64(DefaultWorkerTerminationGrace)
@@ -88,8 +114,7 @@ func NewWorkerConfigFromEnv() WorkerConfig {
 		Image:                         getEnv("WORKER_IMAGE", "pipeline-job:latest"),
 		ImagePullPolicy:               corev1.PullPolicy(getEnv("WORKER_IMAGE_PULL_POLICY", string(corev1.PullIfNotPresent))),
 		MinioEndpoint:                 getEnv("WORKER_MINIO_ENDPOINT", "http://minio.minio:9000"),
-		AccessKey:                     getEnv("MINIO_ACCESS_KEY", "minioadmin"),
-		SecretKey:                     getEnv("MINIO_SECRET_KEY", "minioadmin"),
+		CredentialsSecret:             credentialsSecretFromEnv(),
 	}
 }
 
@@ -674,6 +699,21 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 	}
 
 	w := r.Worker
+	env := []corev1.EnvVar{
+		{Name: "JOB_NAME", Value: job.Name},
+		{Name: "DURATION", Value: fmt.Sprintf("%d", duration)},
+		{Name: "BUCKET", Value: bucket},
+		{Name: "MARKER_PATH", Value: bucket + "/" + key},
+		{Name: "STAGE", Value: job.Spec.Stage},
+		{Name: "MINIO_ENDPOINT", Value: w.MinioEndpoint},
+	}
+	if w.CredentialsSecret != "" {
+		// Read from the Secret at container start; the pod spec holds no credential values.
+		env = append(env,
+			secretEnv("MINIO_ACCESS_KEY", w.CredentialsSecret, "accessKey"),
+			secretEnv("MINIO_SECRET_KEY", w.CredentialsSecret, "secretKey"),
+		)
+	}
 	backoffLimit := int32(0)
 	var grace *int64
 	if w.TerminationGracePeriodSeconds > 0 {
@@ -702,16 +742,7 @@ func (r *PipelineJobReconciler) createUnderlyingJob(ctx context.Context, job *pi
 									corev1.ResourceMemory: mem,
 								},
 							},
-							Env: []corev1.EnvVar{
-								{Name: "JOB_NAME", Value: job.Name},
-								{Name: "DURATION", Value: fmt.Sprintf("%d", duration)},
-								{Name: "BUCKET", Value: bucket},
-								{Name: "MARKER_PATH", Value: bucket + "/" + key},
-								{Name: "STAGE", Value: job.Spec.Stage},
-								{Name: "MINIO_ENDPOINT", Value: w.MinioEndpoint},
-								{Name: "MINIO_ACCESS_KEY", Value: w.AccessKey},
-								{Name: "MINIO_SECRET_KEY", Value: w.SecretKey},
-							},
+							Env: env,
 						},
 					},
 				},
@@ -755,11 +786,57 @@ func (r *PipelineJobReconciler) dependentsOf(_ context.Context, obj client.Objec
 	return reqs
 }
 
+// isWorkerPod reports whether the pod belongs to a worker Job created by this controller.
+func isWorkerPod(o client.Object) bool {
+	return strings.HasPrefix(o.GetLabels()["job-name"], "job-")
+}
+
+// podUpdateReleasesCapacity reports whether a pod update is the moment its resources
+// are freed: the pod finished (Succeeded/Failed) without having been finished before.
+func podUpdateReleasesCapacity(oldPod, newPod *corev1.Pod) bool {
+	finished := func(p *corev1.Pod) bool {
+		return p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed
+	}
+	return !finished(oldPod) && finished(newPod)
+}
+
+// capacityReleased is called when a worker pod finishes or is deleted. It drops the
+// cached admission snapshot (otherwise the woken jobs would still see the old,
+// full cluster for up to a second) and wakes every READY job so the first one that
+// fits is admitted right away instead of on the next 3s poll.
+//
+// Capacity is cluster-wide, so READY jobs of all namespaces are woken, not only
+// those next to the pod that was freed.
+func (r *PipelineJobReconciler) capacityReleased(ctx context.Context, pod client.Object) []reconcile.Request {
+	r.Admission.Invalidate()
+	ctrl.Log.Info("job_event", "job", strings.TrimPrefix(pod.GetLabels()["job-name"], "job-"),
+		"event", "POD_RELEASED", "ts", time.Now().UnixMilli())
+
+	list := &pipelinev1.PipelineJobList{}
+	if err := r.List(ctx, list, client.MatchingFields{stateIndexField: string(pipelinev1.StateReady)}); err != nil {
+		ctrl.Log.Error(err, "failed to list READY jobs after a worker pod was released")
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0, len(list.Items))
+	for i := range list.Items {
+		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
+	}
+	return reqs
+}
+
 func (r *PipelineJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Index jobs by storage marker so duplicate markers are found without a scan.
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &pipelinev1.PipelineJob{}, markerIndexField,
+	// Index jobs by storage marker so duplicate markers are found without a scan,
+	// and by state so READY jobs can be woken cheaply.
+	indexer := mgr.GetFieldIndexer()
+	if err := indexer.IndexField(context.Background(), &pipelinev1.PipelineJob{}, markerIndexField,
 		func(o client.Object) []string {
 			return []string{o.(*pipelinev1.PipelineJob).Spec.StorageMarker}
+		}); err != nil {
+		return err
+	}
+	if err := indexer.IndexField(context.Background(), &pipelinev1.PipelineJob{}, stateIndexField,
+		func(o client.Object) []string {
+			return []string{string(o.(*pipelinev1.PipelineJob).Status.State)}
 		}); err != nil {
 		return err
 	}
@@ -778,6 +855,21 @@ func (r *PipelineJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					o, ok1 := e.ObjectOld.(*pipelinev1.PipelineJob)
 					n, ok2 := e.ObjectNew.(*pipelinev1.PipelineJob)
 					return ok1 && ok2 && upstreamFinished(o, n)
+				},
+			})).
+		// Hand a freed slot to a waiting READY job as soon as a worker pod finishes or is
+		// deleted (the moment its resources are actually released), not at the next poll.
+		// A PipelineJob turning DONE is not that moment: the marker can appear while the pod
+		// is still running. The 3s requeue stays as a fallback.
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.capacityReleased),
+			builder.WithPredicates(predicate.Funcs{
+				CreateFunc:  func(event.CreateEvent) bool { return false },
+				GenericFunc: func(event.GenericEvent) bool { return false },
+				DeleteFunc:  func(e event.DeleteEvent) bool { return isWorkerPod(e.Object) },
+				UpdateFunc: func(e event.UpdateEvent) bool {
+					o, ok1 := e.ObjectOld.(*corev1.Pod)
+					n, ok2 := e.ObjectNew.(*corev1.Pod)
+					return ok1 && ok2 && isWorkerPod(n) && podUpdateReleasesCapacity(o, n)
 				},
 			})).
 		Complete(r)

@@ -46,11 +46,10 @@ func newTestReconciler(t *testing.T, objs ...client.Object) (*PipelineJobReconci
 		Eviction:  NewEvictionManager(c),
 		Storage:   storage,
 		Worker: WorkerConfig{
-			Image:           "worker:test",
-			ImagePullPolicy: corev1.PullIfNotPresent,
-			MinioEndpoint:   "http://minio.minio:9000",
-			AccessKey:       "ak",
-			SecretKey:       "sk",
+			Image:             "worker:test",
+			ImagePullPolicy:   corev1.PullIfNotPresent,
+			MinioEndpoint:     "http://minio.minio:9000",
+			CredentialsSecret: "minio-credentials",
 		},
 	}, c, f
 }
@@ -216,6 +215,34 @@ func TestHandleReady_ClearsStaleMarkerAndSubmitsWithRealRequests(t *testing.T) {
 	}
 	if env["BUCKET"] != "test-bucket" || env["MARKER_PATH"] != "test-bucket/stage-1/_SUCCESS" {
 		t.Errorf("bucket/marker env = %q / %q", env["BUCKET"], env["MARKER_PATH"])
+	}
+	// Credentials come from the Secret, never as literal values in the pod spec.
+	for _, name := range []string{"MINIO_ACCESS_KEY", "MINIO_SECRET_KEY"} {
+		var found *corev1.EnvVar
+		for i := range ctr.Env {
+			if ctr.Env[i].Name == name {
+				found = &ctr.Env[i]
+			}
+		}
+		if found == nil {
+			t.Fatalf("%s missing from the worker env", name)
+		}
+		if found.Value != "" {
+			t.Errorf("%s has a literal value %q; it must come from a Secret", name, found.Value)
+		}
+		ref := found.ValueFrom
+		if ref == nil || ref.SecretKeyRef == nil || ref.SecretKeyRef.Name != "minio-credentials" {
+			t.Errorf("%s does not use SecretKeyRef minio-credentials: %+v", name, found.ValueFrom)
+		}
+	}
+	keys := map[string]string{}
+	for _, e := range ctr.Env {
+		if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+			keys[e.Name] = e.ValueFrom.SecretKeyRef.Key
+		}
+	}
+	if keys["MINIO_ACCESS_KEY"] != "accessKey" || keys["MINIO_SECRET_KEY"] != "secretKey" {
+		t.Errorf("secret keys = %v, want accessKey / secretKey", keys)
 	}
 	if env["MINIO_ENDPOINT"] != "http://minio.minio:9000" || ctr.Image != "worker:test" {
 		t.Errorf("worker config not applied: endpoint=%q image=%q", env["MINIO_ENDPOINT"], ctr.Image)
@@ -610,5 +637,111 @@ func TestDependentsOf_UnknownJobHasNoDependents(t *testing.T) {
 	r, _, _ := newTestReconciler(t)
 	if got := r.dependentsOf(context.Background(), pj("ghost", pipelinev1.StateDone)); len(got) != 0 {
 		t.Errorf("dependents = %v, want none", got)
+	}
+}
+
+func TestWorkerCredentialsSecretIsConfigurable(t *testing.T) {
+	if got := NewWorkerConfigFromEnv().CredentialsSecret; got != "minio-credentials" {
+		t.Errorf("default secret = %q, want minio-credentials", got)
+	}
+	t.Setenv("WORKER_CREDENTIALS_SECRET", "my-secret")
+	if got := NewWorkerConfigFromEnv().CredentialsSecret; got != "my-secret" {
+		t.Errorf("secret = %q, want my-secret", got)
+	}
+	t.Setenv("WORKER_CREDENTIALS_SECRET", "")
+	if got := NewWorkerConfigFromEnv().CredentialsSecret; got != "" {
+		t.Errorf("explicitly empty must disable injection, got %q", got)
+	}
+}
+
+func TestUnderlyingJob_NoCredentialEnvWhenSecretUnset(t *testing.T) {
+	r, c, _ := newTestReconciler(t, node("n1", "4", "8Gi"), pj("x", pipelinev1.StateReady))
+	r.Worker.CredentialsSecret = ""
+	if _, err := r.handleReady(context.Background(), get(t, c, "x")); err != nil {
+		t.Fatal(err)
+	}
+	underlying := &batchv1.Job{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "job-x", Namespace: "default"}, underlying); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range underlying.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "MINIO_ACCESS_KEY" || e.Name == "MINIO_SECRET_KEY" {
+			t.Errorf("%s injected although no credentials Secret is configured", e.Name)
+		}
+	}
+}
+
+func TestCapacityReleased_WakesReadyJobsInAllNamespacesAndInvalidatesSnapshot(t *testing.T) {
+	other := pj("ready-elsewhere", pipelinev1.StateReady)
+	other.Namespace = "other"
+	r, c, _ := newTestReconciler(t,
+		node("n1", "4", "8Gi"),
+		pj("ready-1", pipelinev1.StateReady),
+		pj("ready-2", pipelinev1.StateReady),
+		other,
+		pj("running", pipelinev1.StateRunning),
+		pj("waiting", pipelinev1.StateWaiting),
+		pj("done", pipelinev1.StateDone),
+	)
+	// Use a long-lived snapshot to prove the event drops it.
+	r.Admission.SnapshotTTL = time.Hour
+	ctx := context.Background()
+	probe := readyJob("probe", pipelinev1.PriorityBatch, "3", "1Gi")
+	if ok, _ := r.Admission.HasCapacity(ctx, probe); !ok {
+		t.Fatal("setup: empty node must fit the probe")
+	}
+	if err := c.Create(ctx, pod("someone", "n1", "3", "1Gi", corev1.PodRunning)); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := r.Admission.HasCapacity(ctx, probe); !ok {
+		t.Fatal("setup: the cached snapshot should still be in use")
+	}
+
+	reqs := r.capacityReleased(ctx, workerPod("x", "n1", "1", "1Gi"))
+
+	got := map[string]bool{}
+	for _, q := range reqs {
+		got[q.Namespace+"/"+q.Name] = true
+	}
+	want := []string{"default/ready-1", "default/ready-2", "other/ready-elsewhere"}
+	if len(got) != len(want) {
+		t.Errorf("woken = %v, want exactly the READY jobs %v", got, want)
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("READY job %s was not woken", w)
+		}
+	}
+	if ok, _ := r.Admission.HasCapacity(ctx, probe); ok {
+		t.Error("the snapshot was not invalidated: the woken job would still see the stale, empty-looking cluster")
+	}
+}
+
+func TestPodUpdateReleasesCapacity(t *testing.T) {
+	mk := func(phase corev1.PodPhase) *corev1.Pod { return &corev1.Pod{Status: corev1.PodStatus{Phase: phase}} }
+	tests := []struct {
+		from, to corev1.PodPhase
+		want     bool
+	}{
+		{corev1.PodRunning, corev1.PodSucceeded, true},
+		{corev1.PodRunning, corev1.PodFailed, true},
+		{corev1.PodPending, corev1.PodFailed, true},
+		{corev1.PodPending, corev1.PodRunning, false},
+		{corev1.PodSucceeded, corev1.PodSucceeded, false}, // already finished: nothing new freed
+		{corev1.PodRunning, corev1.PodRunning, false},
+	}
+	for _, tt := range tests {
+		if got := podUpdateReleasesCapacity(mk(tt.from), mk(tt.to)); got != tt.want {
+			t.Errorf("%s -> %s: got %v, want %v", tt.from, tt.to, got, tt.want)
+		}
+	}
+}
+
+func TestIsWorkerPod(t *testing.T) {
+	if !isWorkerPod(workerPod("x", "n1", "1", "1Gi")) {
+		t.Error("a pod of a controller-created Job must be recognised")
+	}
+	if isWorkerPod(pod("unrelated", "n1", "1", "1Gi", corev1.PodRunning)) {
+		t.Error("an unrelated pod must not wake jobs")
 	}
 }

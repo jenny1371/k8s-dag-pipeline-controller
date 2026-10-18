@@ -59,6 +59,9 @@ func newClient(t *testing.T, objs ...client.Object) client.Client {
 		WithIndex(&pipelinev1.PipelineJob{}, markerIndexField, func(o client.Object) []string {
 			return []string{o.(*pipelinev1.PipelineJob).Spec.StorageMarker}
 		}).
+		WithIndex(&pipelinev1.PipelineJob{}, stateIndexField, func(o client.Object) []string {
+			return []string{string(o.(*pipelinev1.PipelineJob).Status.State)}
+		}).
 		Build()
 }
 
@@ -264,5 +267,27 @@ func TestSnapshotTTLZeroDisablesCaching(t *testing.T) {
 	}
 	if ok, _ := a.HasCapacity(ctx, job); ok {
 		t.Error("with caching disabled the new pod must be seen immediately")
+	}
+}
+
+func TestFinishedWorkerPodReleasesItsJobsClaim(t *testing.T) {
+	// A PipelineJob is still RUNNING (the controller has not seen its marker yet) but
+	// its pod has already Succeeded: its 3 CPU are free again and must be reusable now.
+	job := runningBatch("busy", "3", "1Gi")
+	done := workerPod("busy", "n1", "3", "1Gi")
+	done.Status.Phase = corev1.PodSucceeded
+	a := NewAdmissionChecker(newClient(t, node("n1", "4", "8Gi"), job, done))
+	a.SnapshotTTL = 0
+
+	next := readyJob("next", pipelinev1.PriorityBatch, "3", "1Gi")
+	if ok, err := a.HasCapacity(context.Background(), next); err != nil || !ok {
+		t.Errorf("got (%v, %v), want (true, nil): a finished pod must not keep holding its job's claim", ok, err)
+	}
+
+	// A job with no pod at all still holds its (virtual) claim.
+	a2 := NewAdmissionChecker(newClient(t, node("n1", "4", "8Gi"), job))
+	a2.SnapshotTTL = 0
+	if ok, _ := a2.HasCapacity(context.Background(), next); ok {
+		t.Error("a RUNNING job whose pod does not exist yet must still hold its claim")
 	}
 }
