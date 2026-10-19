@@ -56,6 +56,21 @@ wait_no_workers() {
 
 cleanup() { kubectl delete pipelinejobs --all >/dev/null 2>&1; wait_no_workers; }
 
+restarts() {
+  kubectl get pod -l app=dag-pipeline-controller -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null
+}
+
+# Save the controller log right after each scenario, including the previous container's
+# log if the controller restarted, so a restart cannot make earlier results disappear.
+dump_logs() { # <scenario>
+  {
+    kubectl logs deploy/dag-pipeline-controller --previous --tail=-1 2>/dev/null
+    kubectl logs deploy/dag-pipeline-controller --tail=-1 2>/dev/null
+  } > "$OUT/$LABEL.$1.log"
+  local now; now=$(restarts)
+  [ "$now" != "$RESTARTS_AT_START" ] && echo "WARN: the controller restarted during this run (restarts $RESTARTS_AT_START -> $now); see bench/README.md" >&2
+}
+
 dag() {
   echo "== dag: $ROUNDS chains" >&2
   local r i dep
@@ -103,9 +118,10 @@ handoff() {
   cleanup
 }
 
+RESTARTS_AT_START=$(restarts)
+rm -f "$OUT/$LABEL.log" "$OUT/$LABEL".*.log
 cleanup
-dag
-evict
-handoff
-kubectl logs deploy/dag-pipeline-controller --tail=-1 > "$OUT/$LABEL.log"
-echo "wrote $OUT/$LABEL.log and $OUT/$LABEL-handoff.txt" >&2
+dag; dump_logs dag
+evict; dump_logs evict
+handoff; dump_logs handoff
+echo "wrote $OUT/$LABEL.{dag,evict,handoff}.log and $OUT/$LABEL-handoff.txt" >&2

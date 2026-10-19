@@ -3,7 +3,7 @@
 
 Usage:  python3 bench/analyze.py <label> [<label> ...]
 
-Each label reads bench/results/<label>.log (the controller's job_event log lines)
+Each label reads bench/results/<label>.<scenario>.log (the controller's job_event log lines)
 and bench/results/<label>-handoff.txt (worker exit timestamps). Passing two labels,
 e.g. `before after`, prints them side by side.
 """
@@ -33,20 +33,30 @@ def fmt(xs):
     return f"{percentile(xs, 50):.2f} / {percentile(xs, 95):.2f} / {xs[-1]:.2f} (n={len(xs)})"
 
 
+def log_files(label):
+    """<label>.log (older runs) and every <label>.<scenario>.log written by run.sh."""
+    return sorted(
+        os.path.join(RESULTS, f)
+        for f in os.listdir(RESULTS)
+        if f == f"{label}.log" or (f.startswith(f"{label}.") and f.endswith(".log"))
+    )
+
+
 def load_events(label):
     """{job: {event: ts_ms}} using the first occurrence of each event."""
     events = {}
-    with open(os.path.join(RESULTS, f"{label}.log"), encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            if d.get("msg") == "job_event":
-                events.setdefault(d["job"], {}).setdefault(d["event"], d["ts"])
+    for path in log_files(label):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("msg") == "job_event":
+                    events.setdefault(d["job"], {}).setdefault(d["event"], d["ts"])
     return events
 
 
